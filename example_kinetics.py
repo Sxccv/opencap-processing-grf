@@ -1,41 +1,41 @@
-'''
-    ---------------------------------------------------------------------------
-    OpenCap processing: example_kinetics.py
-    ---------------------------------------------------------------------------
-    Copyright 2022 Stanford University and the Authors
-    
-    Author(s): Antoine Falisse, Scott Uhlrich
-    
-    Licensed under the Apache License, Version 2.0 (the "License"); you may not
-    use this file except in compliance with the License. You may obtain a copy
-    of the License at http://www.apache.org/licenses/LICENSE-2.0
-    Unless required by applicable law or agreed to in writing, software
-    distributed under the License is distributed on an "AS IS" BASIS,
-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    See the License for the specific language governing permissions and
-    limitations under the License.
-    
-    This code makes use of CasADi, which is licensed under LGPL, Version 3.0;
-    https://github.com/casadi/casadi/blob/master/LICENSE.txt.
-    
-    Install requirements:
-        - Visit https://github.com/stanfordnmbl/opencap-processing for details.        
-        - Third-party software packages:
-            - CMake: https://cmake.org/download/.
-            - (Windows only)
-                - Visual studio: https://visualstudio.microsoft.com/downloads/.
-                    - Make sure you install C++ support.
-                    - Code tested with community editions 2017-2019-2022.
-            
-    Please contact us for any questions: https://www.opencap.ai/#contact
-'''
+"""
+---------------------------------------------------------------------------
+OpenCap processing: example_kinetics.py
+---------------------------------------------------------------------------
+Copyright 2022 Stanford University and the Authors
+
+Author(s): Antoine Falisse, Scott Uhlrich
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy
+of the License at http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+This code makes use of CasADi, which is licensed under LGPL, Version 3.0;
+https://github.com/casadi/casadi/blob/master/LICENSE.txt.
+
+Install requirements:
+    - Visit https://github.com/stanfordnmbl/opencap-processing for details.
+    - Third-party software packages:
+        - CMake: https://cmake.org/download/.
+        - (Windows only)
+            - Visual studio: https://visualstudio.microsoft.com/downloads/.
+                - Make sure you install C++ support.
+                - Code tested with community editions 2017-2019-2022.
+
+Please contact us for any questions: https://www.opencap.ai/#contact
+"""
 
 # %% Directories, paths, and imports. You should not need to change anything.
 import os
 import sys
 
 baseDir = os.getcwd()
-opensimADDir = os.path.join(baseDir, 'UtilsDynamicSimulations', 'OpenSimAD')
+opensimADDir = os.path.join(baseDir, "UtilsDynamicSimulations", "OpenSimAD")
 sys.path.append(baseDir)
 sys.path.append(opensimADDir)
 
@@ -43,7 +43,7 @@ from utilsOpenSimAD import processInputsOpenSimAD, plotResultsOpenSimAD
 from mainOpenSimAD import run_tracking
 
 # %% User inputs.
-'''
+"""
 Please provide:
     
     session_id:     This is a 36 character-long string. You can find the ID of
@@ -103,49 +103,49 @@ verify the biomechanical validity of the results; we only made sure the
 simulations converged to kinematic solutions that were visually reasonable.
 
 Please contact us for any questions: https://www.opencap.ai/#contact
-'''
+"""
 
 # We provide a few examples for overground and treadmill activities.
 # Select which example you would like to run.
-session_type = "overground" # Options are 'overground' and 'treadmill'.
+session_type = "overground"  # Options are 'overground' and 'treadmill'.
 session_id = "OpenCapData_ab7eb7cf-817d-4035-a30b-ee68773906cb"
-case = '0' # Change this to compare across settings.
+case = "0"  # Change this to compare across settings.
 # Options are 'squat', 'STS', and 'jump'.
-if session_type == 'overground': 
-    trial_name = 'Suhasno_2'
-    if trial_name == 'squat': # Squat
-        motion_type = 'squats'
+if session_type == "overground":
+    trial_name = "Suhasno_2"
+    if trial_name == "squat":  # Squat
+        motion_type = "squats"
         repetition = 1
-    elif trial_name == 'STS': # Sit-to-stand        
-        motion_type = 'sit_to_stand'
+    elif trial_name == "STS":  # Sit-to-stand
+        motion_type = "sit_to_stand"
         repetition = 1
-    elif trial_name == 'jump': # Jump  
-        motion_type = 'jumping'
+    elif trial_name == "jump":  # Jump
+        motion_type = "jumping"
         time_window = [1.3, 2.2]
-    elif trial_name == "Suhasno_2": # Suhasno walking trial
+    elif trial_name == "Suhasno_2":  # Suhasno walking trial
         motion_type = "walking"
-        time_window = [0.0, 1.0] # Adjust time window as needed for the trial
-        repetition = None # Repetition not needed for walking
+        time_window = [0.0, 1.0]  # Adjust time window as needed for the trial
+        repetition = None  # Repetition not needed for walking
 # Options are 'walk_1_25ms', 'run_2_5ms', and 'run_4ms'.
-elif session_type == 'treadmill': 
-    trial_name = 'walk_1_25ms'
-    torque_driven_model = False # Example with torque-driven model.
-    if trial_name == 'walk_1_25ms': # Walking, 1.25 m/s
-        motion_type = 'walking'
+elif session_type == "treadmill":
+    trial_name = "walk_1_25ms"
+    torque_driven_model = False  # Example with torque-driven model.
+    if trial_name == "walk_1_25ms":  # Walking, 1.25 m/s
+        motion_type = "walking"
         time_window = [1.0, 2.5]
         treadmill_speed = 1.25
-    elif trial_name == 'run_2_5ms': # Running, 2.5 m/s
+    elif trial_name == "run_2_5ms":  # Running, 2.5 m/s
         if torque_driven_model:
-            motion_type = 'running_torque_driven'
+            motion_type = "running_torque_driven"
         else:
-            motion_type = 'running'
+            motion_type = "running"
         time_window = [1.4, 2.6]
         treadmill_speed = 2.5
-    elif trial_name == 'run_4ms': # Running with periodic constraints, 4.0 m/s
-        motion_type = 'my_periodic_running'
+    elif trial_name == "run_4ms":  # Running with periodic constraints, 4.0 m/s
+        motion_type = "my_periodic_running"
         time_window = [3.1833333, 3.85]
         treadmill_speed = 4.0
-    
+
 # Set to True to solve the optimal control problem.
 solveProblem = True
 # Set to True to analyze the results of the optimal control problem. If you
@@ -156,24 +156,40 @@ solveProblem = True
 analyzeResults = True
 
 # Path to where you want the data to be downloaded.
-dataFolder = baseDir # Set dataFolder to the base directory
+dataFolder = baseDir  # Set dataFolder to the base directory
 
-# %% Setup. 
-if not 'time_window' in locals():
+# %% Setup.
+if not "time_window" in locals():
     time_window = None
-if not 'repetition' in locals():
+if not "repetition" in locals():
     repetition = None
-if not 'treadmill_speed' in locals():
+if not "treadmill_speed" in locals():
     treadmill_speed = 0
-if not 'contact_side' in locals():
-    contact_side = 'all'
-settings = processInputsOpenSimAD(baseDir, dataFolder, session_id, trial_name, 
-                                  motion_type, time_window, repetition,
-                                  treadmill_speed, contact_side, use_local_data=True)
+if not "contact_side" in locals():
+    contact_side = "all"
+settings = processInputsOpenSimAD(
+    baseDir,
+    dataFolder,
+    session_id,
+    trial_name,
+    motion_type,
+    time_window,
+    repetition,
+    treadmill_speed,
+    contact_side,
+    use_local_data=True,
+)
 
 # %% Simulation.
-run_tracking(baseDir, dataFolder, session_id, settings, case=case, 
-              solveProblem=solveProblem, analyzeResults=analyzeResults)
+run_tracking(
+    baseDir,
+    dataFolder,
+    session_id,
+    settings,
+    case=case,
+    solveProblem=solveProblem,
+    analyzeResults=analyzeResults,
+)
 
 # %% Plots.
 # To compare different cases, add to the cases list, eg cases=['0','1'].
