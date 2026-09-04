@@ -10,3 +10,4 @@ pyyaml
 joblib
 cmake
 seaborn
+psutil
