@@ -11,3 +11,4 @@ joblib
 cmake
 seaborn
 psutil
+pytest

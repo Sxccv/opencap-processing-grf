@@ -54,3 +54,118 @@ Archived code base corresponding to publication: https://zenodo.org/record/74199
 ### Locally
 - Follow the install requirements above
 - Open `batchDownload.py` and follow the instructions
+
+# Windowed-GRF Solving
+
+Estimating ground reaction forces for a whole trial in one optimal control problem is slow and fragile: a single hard second can stop the solve and leave you with nothing. This workflow splits a trial's kinematics into 1-second windows, solves each one independently in a worker pool sized to available RAM, and records what converged. A window that fails costs you that window, not the run.
+
+Three scripts run in order. Each is independently re-runnable.
+
+## Prerequisites
+
+- The full install above, including the **Muscle-driven simulations** section — this workflow builds and runs the OpenSimAD external function.
+- `python -m pip install -r requirements.txt` (adds `psutil` for RAM sizing and `pytest`).
+- `.env` with `API_TOKEN` present. Run `python createAuthenticationEnvFile.py` once if you have not.
+
+## 1. Download the session
+
+`01_download_session.py` has no command-line flags. Edit the three values at the top of the file:
+
+```python
+session_uuid = "ab7eb7cf-817d-4035-a30b-ee68773906cb"   # raw 36-char UUID, no "OpenCapData_" prefix
+trial_name   = "Suhasno_1"
+dataFolder   = os.path.dirname(os.path.abspath(__file__))
+```
+
+```bash
+python 01_download_session.py
+```
+
+Downloads marker data, IK results, the model and metadata into `OpenCapData_<uuid>/`. Skips videos and calibration images, so it is much lighter than a full `download_session`. It is idempotent: if the trial `.mot` already exists it prints a message and exits without downloading. Delete the session folder to force a re-download.
+
+## 2. Solve the windows
+
+```bash
+python 02_run_grf_simulation.py
+```
+
+A bare invocation uses the defaults in the config block at the top of the file. Every one of them has a flag:
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `--session-uuid` | Raw 36-char UUID, no `OpenCapData_` prefix | `ab7eb7cf-…` |
+| `--trial-name` | Trial (kinematics `.mot` stem) to simulate | `Suhasno_1` |
+| `--motion-type` | `walking` / `running` / `squats` / `sit_to_stand` | `walking` |
+| `--contact-side` | `all`, `left` or `right` | `all` |
+| `--treadmill-speed` | m/s; `0` means overground | `0` |
+| `--repetition` | Repetition index for squats and sit-to-stand | none |
+| `--only-missing` | Re-run only windows that did not converge last time | off |
+
+```bash
+python 02_run_grf_simulation.py --trial-name Suhasno_2 --motion-type running
+```
+
+**What it does, in order.** It reads the trial's time range from the kinematics `.mot` and cuts it into 1-second windows, merging a trailing window shorter than 0.5 s into the one before it. Unless `--only-missing` is set, it moves any pre-existing output into `_archive_<timestamp>/` so a fresh run cannot be confused by stale files. It then builds the C++ external function **once, serially** — `buildExternalFunction` writes to repo-global scratch paths, so concurrent first builds corrupt each other. Only then does it start the pool.
+
+**How many windows run at once.** `available_RAM − 1 GB reserve`, divided by 2 GB per worker, capped by the CPU count and by the number of windows, and never below 1. An IPOPT solve for one window plateaus around 1.7–2.0 GB. The chosen worker count is printed before the pool starts. `OMP_NUM_THREADS=1` is set in the parent process, so each solve stays single-threaded rather than every worker spawning a thread per core.
+
+The muscle-tendon parameter and polynomial caches in the session `Model/` folder cannot be primed by the warm-up — which polynomial variant a window needs depends on that window's own range of motion — so they are guarded by a cross-process file lock (`UtilsDynamicSimulations/OpenSimAD/sharedPrepLockOpenSimAD.py`). The first worker to reach that region builds them while the others wait, then everyone loads from disk.
+
+**Runtime: 5–15 minutes per window.** A 7-second trial is 7 windows.
+
+**Outputs**, under `OpenCapData_<uuid>/OpenSimData/Dynamics/<trial_name>/`:
+
+- `GRF_resultant_<trial>_<trial>_window_<i>.mot` — one per converged window
+- `stats_<trial>_window_<i>.npy` — IPOPT statistics, written whether or not the solve converged
+- `optimaltrajectories_<trial>_window_<i>.npy` — per-window trajectories
+- `optimaltrajectories.npy` — the aggregate, merged serially after the pool
+- `window_manifest_<trial>.json` — what converged, the IPOPT return status, and a `failure_reason` for anything that did not
+
+A window counts as converged only if its stats file says `success`, the GRF file exists, **and** that file is newer than the run that claimed it.
+
+**Resuming.** If some windows failed, fix what caused it and re-run with `--only-missing`. Converged windows are skipped with their manifest rows preserved and nothing archived.
+
+```bash
+python 02_run_grf_simulation.py --only-missing
+```
+
+**Solving a single window** — useful for a first smoke test as a full run takes a lot of time.
+
+```python
+START_TIME = 0.0
+END_TIME   = 1.0
+```
+
+### 3. Build the CSV
+
+```bash
+python 03_build_grf_csv.py
+```
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `--session-uuid` | Must match what `02` used | `ab7eb7cf-…` |
+| `--trial-name` | Must match what `02` used | `Suhasno_1` |
+| `--no-plots` | Skip the 2×3 matplotlib plot window | show plots |
+
+Reads the manifest and takes only converged windows and concatenates them sorted by time with duplicate timestamps at window boundaries dropped written to `dataFolder`:
+
+- `grf_df_<trial>_<session_id>.csv`
+- `grf_df_<trial>_<session_id>_coverage.json` — which time ranges have GRF and which are gaps
+
+It warns about any window whose force components are all near zero, which usually means a degenerate no-contact solution, and any manifest entry file that has since gone missing. Coverage is reported against the full kinematics range.
+
+```
+Trial Suhasno_1: kinematics [0.00, 7.30] s
+GRF coverage: [0.00, 6.00] s  (6.00s / 7.30s = 82.2%)
+GAP: [6.00, 7.30] s
+```
+
+## Supporting modules
+
+| File | Role |
+| --- | --- |
+| `pipeline_io.py` | Session folder layout, `.mot` reading, and the `TrialSpec` / `WindowResult` records passed between the orchestrator and its workers |
+| `parallel_config.py` | Worker-count arithmetic and the serial merge of the trajectory aggregate |
+| `grf_prediction.py` | `solve_window` — runs one window and decides whether it converged. A library, not an entry point |
+| `UtilsDynamicSimulations/OpenSimAD/sharedPrepLockOpenSimAD.py` | The cross-process lock guarding `run_tracking`'s one-time model caches |

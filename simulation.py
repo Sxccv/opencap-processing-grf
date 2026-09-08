@@ -76,8 +76,7 @@ for frame_idx in range(frame_count):
     # Convert plot to numpy image
     canvas = FigureCanvas(fig)
     canvas.draw()
-    plot_img = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
-    plot_img = plot_img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    plot_img = np.asarray(canvas.buffer_rgba())[:, :, :3]  # RGBA -> RGB
     plt.close(fig)
 
     # Resize with smooth interpolation to avoid "stretchy text"

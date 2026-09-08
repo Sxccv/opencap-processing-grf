@@ -16,7 +16,6 @@ Usage:
 """
 
 import os
-import sys
 
 # Edit these three values before running.
 
