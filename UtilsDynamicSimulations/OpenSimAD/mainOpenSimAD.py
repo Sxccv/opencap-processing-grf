@@ -394,21 +394,22 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
     nSideMuscles = len(rightSideMuscles)
     
     # Extract muscle-tendon parameters (if not done already).
+    # The existence checks and the writes they guard must be atomic with
+    # respect to sibling windows solving the same trial concurrently, hence
+    # the lock. See sharedPrepLockOpenSimAD.SharedPrepLock.
     from muscleDataOpenSimAD import getMTParameters
-    loadMTParameters_l = True
-    loadMTParameters_r = True
-    if not os.path.exists(os.path.join(
-            pathModelFolder, model_full_name + '_mtParameters_l.npy')):
-        loadMTParameters_l = False
-    if not os.path.exists(os.path.join(
-            pathModelFolder, model_full_name + '_mtParameters_r.npy')):
-        loadMTParameters_r = False
-    righSideMtParameters = getMTParameters(pathModelFile, rightSideMuscles,
-                                           loadMTParameters_r, pathModelFolder,
-                                           model_full_name, side='r')
-    leftSideMtParameters = getMTParameters(pathModelFile, leftSideMuscles,
-                                           loadMTParameters_l, pathModelFolder,
-                                           model_full_name, side='l')
+    from sharedPrepLockOpenSimAD import SharedPrepLock
+    with SharedPrepLock(pathModelFolder):
+        loadMTParameters_l = os.path.exists(os.path.join(
+            pathModelFolder, model_full_name + '_mtParameters_l.npy'))
+        loadMTParameters_r = os.path.exists(os.path.join(
+            pathModelFolder, model_full_name + '_mtParameters_r.npy'))
+        righSideMtParameters = getMTParameters(
+            pathModelFile, rightSideMuscles, loadMTParameters_r,
+            pathModelFolder, model_full_name, side='r')
+        leftSideMtParameters = getMTParameters(
+            pathModelFile, leftSideMuscles, loadMTParameters_l,
+            pathModelFolder, model_full_name, side='l')
     mtParameters = np.concatenate((leftSideMtParameters, 
                                    righSideMtParameters), axis=1)
     mtParameters[0,:] = mtParameters[0,:] * scaleIsometricMuscleForce
@@ -753,9 +754,13 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
         # updated_bounds.  Also, create a dummy motion file specific to the
         # trial being processed.
         from utilsOpenSimAD import adjustBoundsAndDummyMotion
-        polynomial_bounds, pathDummyMotion = adjustBoundsAndDummyMotion(
-            polynomial_bounds, updated_bounds, pathDummyMotion,
-            pathModelFolder, trialName, overwriteDummyMotion=False)
+        # Locked: the adjusted dummy motion is keyed by trial, not by window,
+        # so every window that exceeds the default ROM writes the same file --
+        # and the polynomial fit below reads it.
+        with SharedPrepLock(pathModelFolder):
+            polynomial_bounds, pathDummyMotion = adjustBoundsAndDummyMotion(
+                polynomial_bounds, updated_bounds, pathDummyMotion,
+                pathModelFolder, trialName, overwriteDummyMotion=False)
         type_bounds_polynomials = trialName
     
     from functionCasADiOpenSimAD import polynomialApproximation
@@ -770,23 +775,28 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
         rightPolynomialJoints.remove('mtp_angle_r')    
     
     if not torque_driven_model:
-        # Load polynomials if computed already, compute otherwise.    
-        loadPolynomialData = True
-        if (not os.path.exists(os.path.join(
-                pathModelFolder, model_full_name + '_polynomial_r_{}.npy'.format(type_bounds_polynomials)))
-                or not os.path.exists(os.path.join(
-                pathModelFolder, model_full_name + '_polynomial_l_{}.npy'.format(type_bounds_polynomials)))):
-            loadPolynomialData = False        
+        # Load polynomials if computed already, compute otherwise.
+        # Locked, with the existence check inside the lock: whoever gets there
+        # first fits and saves, everyone else then takes the load path. Without
+        # this the fit runs in every worker at once, each with its own joblib
+        # pool, and getPolynomialData's cleanup deletes the shared motion4MA_*
+        # scratch files out from under its neighbours.
         from muscleDataOpenSimAD import getPolynomialData
         polynomialData = {}
-        polynomialData['r'] = getPolynomialData(
-            loadPolynomialData, pathModelFolder, model_full_name, pathDummyMotion, 
-            rightPolynomialJoints, rightSideMuscles, 
-            type_bounds_polynomials=type_bounds_polynomials, side='r')
-        polynomialData['l'] = getPolynomialData(
-            loadPolynomialData, pathModelFolder, model_full_name, pathDummyMotion, 
-            leftPolynomialJoints, leftSideMuscles, 
-            type_bounds_polynomials=type_bounds_polynomials, side='l')     
+        with SharedPrepLock(pathModelFolder):
+            loadPolynomialData = (
+                os.path.exists(os.path.join(
+                    pathModelFolder, model_full_name + '_polynomial_r_{}.npy'.format(type_bounds_polynomials)))
+                and os.path.exists(os.path.join(
+                    pathModelFolder, model_full_name + '_polynomial_l_{}.npy'.format(type_bounds_polynomials))))
+            polynomialData['r'] = getPolynomialData(
+                loadPolynomialData, pathModelFolder, model_full_name, pathDummyMotion,
+                rightPolynomialJoints, rightSideMuscles,
+                type_bounds_polynomials=type_bounds_polynomials, side='r')
+            polynomialData['l'] = getPolynomialData(
+                loadPolynomialData, pathModelFolder, model_full_name, pathDummyMotion,
+                leftPolynomialJoints, leftSideMuscles,
+                type_bounds_polynomials=type_bounds_polynomials, side='l')
         if loadPolynomialData:
             polynomialData['r'] = polynomialData['r'].item()
             polynomialData['l'] = polynomialData['l'].item()
@@ -956,15 +966,14 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
     # We use an orthogonal third-order radau collocation scheme.
     d = 3 # interpolating polynomial.
     tau = ca.collocation_points(d,'radau')
-    [C,D] = ca.collocation_interpolators(tau)
-    # collocation_matrices = ca.collocation_interpolators(tau)
-    # C = np.array(collocation_matrices[:-1]) 
-    # D = np.array(collocation_matrices[-1])
+    # collocation_interpolators returns the pair (C, D). C must stay the
+    # (d+1)x(d+1) nested list it comes back as: it is indexed row-wise as
+    # C[j+1] for j in range(d) below. Wrapping the pair as
+    # np.array(result[:-1]) instead yields shape (1, d+1, d+1) and makes C[1]
+    # an IndexError -- that form has been introduced and reverted twice in
+    # this file's history; do not reintroduce it.
+    [C, D] = ca.collocation_interpolators(tau)
 
-    # print("C shape =", C.shape) 
-    # print(C)
-    # print("D shape =", D.shape) 
-    # print(D)
     if d == 3:  
         B = [0, 0.376403062700467, 0.512485826188421, 0.111111111111111]
     elif d == 2:

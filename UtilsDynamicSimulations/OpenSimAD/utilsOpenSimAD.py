@@ -1795,7 +1795,12 @@ def buildExternalFunction(filename, pathDCAD, CPP_DIR, nInputs,
     fooName = "foo"
     # Use pathBuild, not BIN_DIR, for the generated foo.py when using ExpressionGraphFunction
     if useExpressionGraphFunction:
-        path_external_filename_foo = os.path.join(pathBuild, fooName + '.py')
+        # On Windows the Recorder DLL writes foo.py to BIN_DIR regardless of
+        # the current working directory, so look for it there.
+        if os_system == 'Windows':
+            path_external_filename_foo = os.path.join(BIN_DIR, fooName + '.py')
+        else:
+            path_external_filename_foo = os.path.join(pathBuild, fooName + '.py')
     else:
         path_external_filename_foo = os.path.join(BIN_DIR, fooName + '.py')
 

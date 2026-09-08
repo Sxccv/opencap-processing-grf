@@ -1,0 +1,47 @@
+# Windows conda environment for running grf_prediction.py (and the rest of the
+# OpenSimAD muscle-driven GRF pipeline) locally.
+#
+# OpenSim is NOT available on PyPI; it ships only via the `opensim-org` conda
+# channel. This spec mirrors the upstream macOS `environment.yml` but uses
+# loosely pinned, cross-platform versions that solve on win-64.
+#
+# Create a project-local env (analogous to a venv in the directory):
+#   conda env create -f environment_windows.yml -p ./opensim-env
+# Run the pipeline without activating:
+#   conda run -p ./opensim-env python grf_prediction.py \
+#       --session_id OpenCapData_ab7eb7cf-817d-4035-a30b-ee68773906cb \
+#       --trial_name Suhasno_1 --start_time 0.0 --end_time 2.0
+#
+# NOTE: solving the optimal-control problem also needs Visual Studio C++ Build
+# Tools + the Windows OpenSimAD binaries (compiled external functions). Those are
+# separate, heavier setup steps beyond this Python environment.
+name: opensim-ad
+channels:
+  - opensim-org
+  - conda-forge
+dependencies:
+  - python=3.9
+  - opensim=4.4
+  - casadi=3.5.5
+  - ipopt
+  - numpy=1.20
+  - pandas=1.5.3
+  - scipy=1.10.1
+  - matplotlib=3.7
+  - pillow=9.4          # newer Pillow needs numpy>=1.21; pin for the numpy 1.20 ABI
+  - pyvista<0.38         # full-body mesh rendering for model-mode visualization
+                          #   pinned <0.38 for numpy 1.20 ABI compatibility
+  - py-opencv=4.7        # cv2, used by simulation.py to render GRF over video
+  - seaborn=0.13.2
+  - pyyaml
+  - joblib
+  - requests
+  - python-decouple
+  - cmake
+  - pip
+  - pip:
+      - maskpass==0.3.6
+      - pynput==1.8.1
+      - torch
+      - psutil
+      - pytest

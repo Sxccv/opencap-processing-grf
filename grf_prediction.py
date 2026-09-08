@@ -1,251 +1,122 @@
-# %% Directories, paths, and imports. You should not need to change anything.
+"""Solve one time window of a trial with the OpenSimAD tracking problem.
+
+This module is a library, not an entry point. `02_run_grf_simulation.py` owns
+the orchestration: it sizes the worker pool to available RAM, builds the C++
+external function once before any parallelism, and merges the shared trajectory
+aggregate afterwards. A second orchestrator used to live here; it had none of
+those safeguards, so running it reproduced exactly the races the pool was built
+to avoid. It was removed — drive the pipeline through 02.
+"""
 import os
 import sys
+import time
+import traceback
+
 import numpy as np
-import pandas as pd
-import multiprocessing
-import argparse
 
-baseDir = os.getcwd()
-opensimADDir = os.path.join(baseDir, "UtilsDynamicSimulations", "OpenSimAD")
-sys.path.append(baseDir)
-sys.path.append(opensimADDir)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_OPENSIM_AD_DIR = os.path.join(_HERE, "UtilsDynamicSimulations", "OpenSimAD")
+for _p in (_HERE, _OPENSIM_AD_DIR):
+    if _p not in sys.path:
+        sys.path.append(_p)
 
-from utilsOpenSimAD import processInputsOpenSimAD, plotResultsOpenSimAD
+import pipeline_io
+from pipeline_io import TrialSpec, WindowResult  # noqa: F401  (re-exported)
+from utilsOpenSimAD import processInputsOpenSimAD
 from mainOpenSimAD import run_tracking
 
 
-def get_mot_time_range(mot_file_path):
-    with open(mot_file_path, "r") as f:
-        # Skip header
-        for line in f:
-            if "endheader" in line:
-                break
-        # Read the rest as data
-        times = []
-        for line in f:
-            if line.strip() == "":
-                continue
-            time_str = line.split()[0]
-            try:
-                times.append(float(time_str))
-            except ValueError:
-                continue
-        if times:
-            return min(times), max(times)
-        else:
-            return None, None
+def solve_window(spec, index, time_window):
+    """Run the tracking problem for one window and report what came of it.
 
+    Never raises: a window that blows up is one failed row in the manifest, not
+    a dead pool. The traceback is printed because a five-to-fifteen minute solve
+    is too expensive to debug from a one-line message.
+    """
+    case = pipeline_io.case_name(spec.trial_name, index)
+    win_start, win_end = time_window
+    print(f"Processing window {index}: [{win_start:.2f}, {win_end:.2f}] "
+          f"with case: {case}")
 
-# List to store paths of generated GRF files
-grf_file_paths = []
-
-
-def process_single_window(
-    baseDir,
-    dataFolder,
-    session_id,
-    trial_name,
-    motion_type,
-    current_time_window,
-    repetition,
-    treadmill_speed,
-    contact_side,
-    solveProblem,
-    analyzeResults,
-    case_prefix,
-    window_index,
-):
-
-    current_case = f"{case_prefix}_window_{window_index}"
-    print(f"Processing window: {current_time_window} with case: {current_case}")
-
-    # Set environment variable to prevent nested parallelism issues with joblib/loky
-    os.environ["OMP_NUM_THREADS"] = "1"
-
-    grf_file_path = None
-    optimaltrajectories_file_path = None
+    dyn_dir = spec.dynamics_dir
+    started_at = time.time()
 
     try:
-        # %% Setup.
-        # These variables are passed as arguments now.
         settings = processInputsOpenSimAD(
-            baseDir,
-            dataFolder,
-            session_id,
-            trial_name,
-            motion_type,
-            current_time_window,
-            repetition,
-            treadmill_speed,
-            contact_side,
-            use_local_data=True,
+            spec.baseDir, spec.dataFolder, spec.session_id, spec.trial_name,
+            spec.motion_type, list(time_window), spec.repetition,
+            spec.treadmill_speed, spec.contact_side, use_local_data=True,
         )
-
-        # %% Simulation.
         run_tracking(
-            baseDir,
-            dataFolder,
-            session_id,
-            settings,
-            case=current_case,
-            solveProblem=solveProblem,
-            analyzeResults=analyzeResults,
+            spec.baseDir, spec.dataFolder, spec.session_id, settings,
+            case=case,
+            solveProblem=spec.solve_problem,
+            analyzeResults=spec.analyze_results,
         )
+    except Exception:
+        print(f"FAIL [{case}]: exception during solve")
+        traceback.print_exc()
+        return WindowResult(index, win_start, win_end, converged=False,
+                            return_status="exception",
+                            failure_reason="exception during solve")
 
-        potential_grf_path = os.path.join(
-            dataFolder,
-            session_id,
-            "OpenSimData",
-            "Dynamics",
-            trial_name,
-            f"GRF_resultant_{trial_name}_{current_case}.mot",
-        )
-        if os.path.exists(potential_grf_path):
-            grf_file_path = potential_grf_path
-        else:
-            print(
-                f"Warning: GRF file not found for window {current_time_window} after simulation."
-            )
+    return _inspect_outputs(spec, index, time_window, case, dyn_dir, started_at)
 
-        optimaltrajectories_file_path = os.path.join(
-            dataFolder,
-            session_id,
-            "OpenSimData",
-            "Dynamics",
-            trial_name,
-            f"optimaltrajectories_{current_case}.npy",
-        )
 
-        if not os.path.exists(optimaltrajectories_file_path):
-            print(
-                f"Warning: Optimal trajectories NPY file not found for window {current_time_window} after simulation. Expected at {optimaltrajectories_file_path}"
-            )
-            optimaltrajectories_file_path = None
+def _inspect_outputs(spec, index, time_window, case, dyn_dir, started_at):
+    """Decide whether this window actually converged, from what it left on disk.
 
+    run_tracking writes stats_<case>.npy whether or not IPOPT converged, so the
+    stats file's `success` flag is the authority. The GRF file is then checked
+    for existence *and* for being newer than this run, so a leftover file from a
+    previous invocation cannot be mistaken for a fresh solve.
+    """
+    win_start, win_end = time_window
+    stats_file = pipeline_io.stats_path(dyn_dir, case)
+    grf_file = pipeline_io.grf_resultant_path(dyn_dir, spec.trial_name, case)
+
+    traj_file = pipeline_io.trajectories_path(dyn_dir, case)
+    if not os.path.exists(traj_file):
+        print(f"Warning: optimal trajectories .npy not found for window "
+              f"{index}. Expected at {traj_file}")
+        traj_file = None
+
+    def failed(reason, status="unknown"):
+        print(f"FAIL [{case}]: {reason}")
+        return WindowResult(index, win_start, win_end, converged=False,
+                            return_status=status, trajectories_path=traj_file,
+                            failure_reason=reason)
+
+    if not os.path.exists(stats_file):
+        return failed(f"no stats file — solver may not have run. "
+                      f"Expected: {stats_file}")
+
+    try:
+        stats = np.load(stats_file, allow_pickle=True).item()
     except Exception as e:
-        print(
-            f"Error processing window {current_time_window} for trial {trial_name}: {e}"
-        )
-        grf_file_path = None
-        optimaltrajectories_file_path = None
+        return failed(f"stats file unreadable: {e}")
 
-    return grf_file_path, optimaltrajectories_file_path
+    status = stats.get("return_status", "unknown")
+    if not stats.get("success", False):
+        return failed(f"IPOPT did not converge (return_status={status})", status)
+    if not os.path.exists(grf_file):
+        return failed(f"converged but no GRF file found. Expected: {grf_file}",
+                      status)
+    if os.path.getmtime(grf_file) < started_at:
+        return failed("GRF file predates this run (stale file from a prior "
+                      "invocation — archived or deleted)", status)
 
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Process OpenCap motion data in windows."
-    )
-    parser.add_argument(
-        "--session_id", type=str, required=True, help="The ID of the OpenCap session."
-    )
-    parser.add_argument(
-        "--trial_name",
-        type=str,
-        required=True,
-        help="The name of the trial to simulate.",
-    )
-    parser.add_argument(
-        "--start_time", type=float, help="Start time of the analysis window."
-    )
-    parser.add_argument(
-        "--end_time", type=float, help="End time of the analysis window."
-    )
-
-    args = parser.parse_args()
-
-    # User Inputs
-    session_id = args.session_id
-    trial_name = args.trial_name
-    session_type = "overground"  # Options are 'overground' and 'treadmill'.
-    motion_type = "walking"
-    if not "repetition" in locals():
-        repetition = None
-    if not "treadmill_speed" in locals():
-        treadmill_speed = 0
-    if not "contact_side" in locals():
-        contact_side = "all"
-    # Set to True to solve the optimal control problem.
-    solveProblem = True
-    # Set to True to analyze the results of the optimal control problem. If you
-    # solved the problem already, and only want to analyze/process the results, you
-    # can set solveProblem to False and run this script with analyzeResults set to
-    # True. This is useful if you do additional post-processing but do not want to
-    # re-run the problem.
-    analyzeResults = True
-
-    # Path to where you want the data to be downloaded.
-    dataFolder = baseDir  # Set dataFolder to the base directory
-
-    sessionFolder = os.path.join(dataFolder, session_id)
-    pathTrial = os.path.join(
-        sessionFolder, "OpenSimData", "Kinematics", trial_name + ".mot"
-    )
-
-    # Use provided start_time and end_time, or determine from mot file if not provided
-    if args.start_time is not None:
-        start_time = args.start_time
-    else:
-        start_time, _ = get_mot_time_range(pathTrial)
-
-    if args.end_time is not None:
-        end_time = args.end_time
-    else:
-        _, end_time = get_mot_time_range(pathTrial)
-
-    if start_time is None or end_time is None:
-        print(
-            "Error: Could not determine time range for analysis. Please provide --start_time and --end_time or ensure the .mot file exists and is valid."
-        )
-        return
-
-    starts = np.arange(start_time, end_time, 1.0)
-    windows = [[s, min(s + 1.0, end_time)] for s in starts]
-
-    if len(windows) > 1:
-        last_dur = windows[-1][1] - windows[-1][0]
-        if 0 < last_dur < 0.5:
-            windows[-2][1] = windows[-1][1]
-            windows.pop()
-
-    # Process windows in parallel
-    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
-        results = pool.starmap(
-            process_single_window,
-            [
-                (
-                    baseDir,
-                    dataFolder,
-                    session_id,
-                    trial_name,
-                    motion_type,
-                    [win_start, win_end],
-                    repetition,
-                    treadmill_speed,
-                    contact_side,
-                    solveProblem,
-                    analyzeResults,
-                    trial_name,
-                    i,
-                )
-                for i, (win_start, win_end) in enumerate(windows)
-            ],
-        )
-
-    grf_file_paths = [r[0] for r in results if r[0] is not None]
-
-    # %% Summary Report
-    num_total_windows = len(windows)
-    num_successful_windows = len(grf_file_paths)
-    num_failed_windows = num_total_windows - num_successful_windows
-
-    print("\n--- Processing Summary ---")
-    print(f"Total windows attempted: {num_total_windows}")
-    print(f"Successfully processed windows: {num_successful_windows}")
-    print(f"Failed windows: {num_failed_windows}")
-    print("------------------------")
+    return WindowResult(index, win_start, win_end, converged=True,
+                        return_status=status, grf_path=grf_file,
+                        trajectories_path=traj_file)
 
 
-if __name__ == "__main__":
-    main()
+def solve_window_task(task):
+    """Unpack a ``(spec, index, time_window)`` tuple.
+
+    ``Pool.imap_unordered`` passes one argument, and results must stream back as
+    they finish so a later worker death cannot discard the windows that already
+    succeeded.
+    """
+    spec, index, time_window = task
+    return solve_window(spec, index, time_window)
