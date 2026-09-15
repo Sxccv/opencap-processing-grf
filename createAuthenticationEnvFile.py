@@ -27,4 +27,4 @@
 from utilsAuthentication import get_token
 import os
 
-get_token(saveEnvPath=os.getcwd())
+get_token(saveEnvPath=os.path.join(os.getcwd(), ".env"))

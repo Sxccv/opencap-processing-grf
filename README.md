@@ -61,11 +61,31 @@ Estimating ground reaction forces for a whole trial in one optimal control probl
 
 Three scripts run in order. Each is independently re-runnable.
 
-## Prerequisites
+## Setup
 
-- The full install above, including the **Muscle-driven simulations** section — this workflow builds and runs the OpenSimAD external function.
-- `python -m pip install -r requirements.txt` (adds `psutil` for RAM sizing and `pytest`).
-- `.env` with `API_TOKEN` present. Run `python createAuthenticationEnvFile.py` once if you have not.
+This workflow needs its own conda environment. The install steps above (Python 3.11, OpenSim 4.5, CasADi from pip) do not work with it. `mainOpenSimAD.py` expects the output format of the conda-forge CasADi 3.5.5 build. The pip CasADi wheels (tested 3.5.5 to 3.8.0) return a different format, and the solve fails with `IndexError`. The environment below was tested on Windows with Python 3.9, OpenSim 4.4.1 and CasADi 3.5.5.
+
+1. Install [Miniforge](https://github.com/conda-forge/miniforge) or Anaconda. Install Visual Studio with the *Desktop development with C++* workload, as described in **Muscle-driven simulations** above. CMake comes with the environment.
+2. From the repo root, create the environment in `opensim-env/` (git-ignored). This takes about 15 minutes:
+   ```bash
+   conda env create -p ./opensim-env -f environment_windows.yml
+   ```
+   The `name: opensim-ad` line in the file is not used when you pass `-p`.
+3. Activate the environment. Do this in every new terminal, from the repo root. All commands below assume the environment is active:
+   ```bash
+   conda activate .\opensim-env
+   ```
+   Do not call `opensim-env\python.exe` without activating first. Without activation, CasADi cannot load IPOPT (`Plugin 'ipopt' is not found`), and the error appears only after several minutes of setup.
+4. Check that OpenSim loads and that CasADi finds IPOPT:
+   ```bash
+   python -c "import opensim, casadi as ca; x=ca.SX.sym('x'); ca.nlpsol('s','ipopt',{'x':x,'f':x**2}); print('casadi', ca.__version__, 'opensim', opensim.__version__, 'IPOPT OK')"
+   ```
+   Expected: `casadi 3.5.5 opensim 4.4.1 IPOPT OK`.
+5. Save your OpenCap API token. You need it only to download a session (step 1). The demo session `OpenCapData_ab7eb7cf-…` is committed with its kinematics, so you can run it without a token. To save a token, run this from the repo root and log in with your app.opencap.ai credentials:
+   ```bash
+   python createAuthenticationEnvFile.py
+   ```
+   This adds `API_TOKEN="<token>"` to `.env` in the current folder. Run it from the repo root, because the scripts read `.env` from there. If `.env` already holds a token, the script does nothing.
 
 ## 1. Download the session
 
@@ -111,7 +131,7 @@ python 02_run_grf_simulation.py --trial-name Suhasno_2 --motion-type running
 
 Which cache a window creates depends on that window's own range of motion. If the workers built them first-come-first-served, a different window could own a cache than in a sequential run, so the prep pass builds them all before any worker starts; workers only load them. The cross-process file lock (`UtilsDynamicSimulations/OpenSimAD/sharedPrepLockOpenSimAD.py`) stays around those regions as a safety net. It also serialises the joint-reaction analyses (`computeKAM` / `computeMCF`), which write scratch files into the `Dynamics/<trial>/` folder that every window shares.
 
-**Runtime: 5–15 minutes per window.** A 7-second trial is 7 windows.
+**Runtime: 5–15 minutes per window.** A 7-second trial is 7 windows. The first run for a session also builds the external function, which takes a few minutes. The build compiles C++ with Visual Studio. If `UtilsDynamicSimulations/OpenSimAD/opensimAD-install/` is missing, the build first downloads the OpenSimAD libraries (about 60 MB) from SourceForge.
 
 **Outputs**, under `OpenCapData_<uuid>/OpenSimData/Dynamics/<trial_name>/`:
 
@@ -129,12 +149,14 @@ A window counts as converged only if its stats file says `success`, the GRF file
 python 02_run_grf_simulation.py --only-missing
 ```
 
-**Solving a single window** — useful for a first smoke test as a full run takes a lot of time.
+**Solving a single window.** A full run takes a long time, so a single window makes a good first smoke test. These values have no flags. Set them in the config block at the top of `02_run_grf_simulation.py`, then run the script as usual:
 
 ```python
 START_TIME = 0.0
 END_TIME   = 1.0
 ```
+
+Set both back to `None` to solve the whole trial.
 
 ### 3. Build the CSV
 
