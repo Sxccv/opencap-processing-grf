@@ -98,18 +98,18 @@ A bare invocation uses the defaults in the config block at the top of the file. 
 | `--motion-type` | `walking` / `running` / `squats` / `sit_to_stand` | `walking` |
 | `--contact-side` | `all`, `left` or `right` | `all` |
 | `--treadmill-speed` | m/s; `0` means overground | `0` |
-| `--repetition` | Repetition index for squats and sit-to-stand | none |
+| `--repetition` | Not supported by the windowed pipeline; passing it exits with an error | none |
 | `--only-missing` | Re-run only windows that did not converge last time | off |
 
 ```bash
 python 02_run_grf_simulation.py --trial-name Suhasno_2 --motion-type running
 ```
 
-**What it does, in order.** It reads the trial's time range from the kinematics `.mot` and cuts it into 1-second windows, merging a trailing window shorter than 0.5 s into the one before it. Unless `--only-missing` is set, it moves any pre-existing output into `_archive_<timestamp>/` so a fresh run cannot be confused by stale files. It then builds the C++ external function **once, serially** — `buildExternalFunction` writes to repo-global scratch paths, so concurrent first builds corrupt each other. Only then does it start the pool.
+**What it does, in order.** It reads the trial's time range from the kinematics `.mot` and cuts it into 1-second windows, merging a trailing window shorter than 0.5 s into the one before it. Unless `--only-missing` is set, it moves any pre-existing output into `_archive_<timestamp>/` so a fresh run cannot be confused by stale files. It then runs a **serial prep pass**: for every window, in index order, it calls `processInputsOpenSimAD` and `run_tracking(..., prepOnly=True)`. The first call builds the C++ external function (`buildExternalFunction` writes to repo-global scratch paths, so concurrent first builds corrupt each other). The pass as a whole builds the muscle-tendon parameter, dummy-motion and polynomial caches in the session `Model/` folder in the same order a sequential run (`grf_prediction_linear.py`) would. Only then does it start the pool.
 
 **How many windows run at once.** `available_RAM − 1 GB reserve`, divided by 2 GB per worker, capped by the CPU count and by the number of windows, and never below 1. An IPOPT solve for one window plateaus around 1.7–2.0 GB. The chosen worker count is printed before the pool starts. `OMP_NUM_THREADS=1` is set in the parent process, so each solve stays single-threaded rather than every worker spawning a thread per core.
 
-The muscle-tendon parameter and polynomial caches in the session `Model/` folder cannot be primed by the warm-up — which polynomial variant a window needs depends on that window's own range of motion — so they are guarded by a cross-process file lock (`UtilsDynamicSimulations/OpenSimAD/sharedPrepLockOpenSimAD.py`). The first worker to reach that region builds them while the others wait, then everyone loads from disk.
+Which cache a window creates depends on that window's own range of motion. If the workers built them first-come-first-served, a different window could own a cache than in a sequential run, so the prep pass builds them all before any worker starts; workers only load them. The cross-process file lock (`UtilsDynamicSimulations/OpenSimAD/sharedPrepLockOpenSimAD.py`) stays around those regions as a safety net. It also serialises the joint-reaction analyses (`computeKAM` / `computeMCF`), which write scratch files into the `Dynamics/<trial>/` folder that every window shares.
 
 **Runtime: 5–15 minutes per window.** A 7-second trial is 7 windows.
 

@@ -21,23 +21,31 @@ Output:
 Usage:
     python 02_run_grf_simulation.py [--session-uuid UUID] [--trial-name TRIAL]
         [--motion-type TYPE] [--contact-side SIDE] [--treadmill-speed M/S]
-        [--repetition N] [--only-missing]
+        [--only-missing]
 
     All flags optional - bare invocation uses the defaults in the config
     block below (session ab7eb7cf-817d-4035-a30b-ee68773906cb, trial Suhasno_1).
+    --repetition is rejected: repetition segmentation replaces every window's
+    interval with that one repetition, so it cannot be combined with windowing.
 
 Runtime note:
     5-15 minutes per 1-second window. Windows are solved in parallel, sized to
-    available RAM (spare ~1 GB, ~2 GB per worker). Two things are shared by
-    every window and so must not be built concurrently:
-      - the C++ external function, built once serially here (warm-up) to avoid
-        concurrent build collisions on repo-global scratch paths;
-      - the muscle-tendon / polynomial caches in the session Model folder, which
-        run_tracking builds on first use. Those are guarded by an inter-process
-        lock (sharedPrepLockOpenSimAD.SharedPrepLock) rather than by the
-        warm-up, because which polynomial variant a window needs depends on that
-        window's own range of motion, so no single warm-up window can prime them
-        all.
+    available RAM (spare ~1 GB, ~2 GB per worker). The results must be the
+    same as a sequential run of the same windows (grf_prediction_linear.py), so
+    everything one window leaves on disk for the next is built before the pool:
+      - A serial prep pass calls processInputsOpenSimAD and
+        run_tracking(prepOnly=True) for every window, in index order. Its first
+        call builds the C++ external function, whose build writes to
+        repo-global scratch paths and so must never run concurrently. The pass
+        as a whole builds the muscle-tendon / dummy-motion / polynomial caches
+        in the session Model folder in exactly the order a sequential run
+        would. Which cache a window creates depends on that window's own range
+        of motion, so first-come-first-served inside the pool could let a
+        different window own a cache than in the sequential run.
+      - Workers then only read those caches. SharedPrepLock
+        (sharedPrepLockOpenSimAD) still guards the cache regions as a safety
+        net, and serialises the joint-reaction analyses, which write scratch
+        files into the results folder all windows share.
     The shared optimaltrajectories.npy is never written by a worker - each
     writes only its own per-case file - and is rebuilt here after the pool.
 """
@@ -51,7 +59,7 @@ import sys
 import traceback
 from datetime import datetime, timezone
 
-import numpy as np
+from pipeline_io import build_windows  # noqa: F401  (also used by tests)
 
 # Configuration - module-level defaults, overridable via CLI flags. These are
 # read once, by parse_args(), and never reassigned.
@@ -71,7 +79,7 @@ DEFAULT_CONTACT_SIDE = "all"
 # Treadmill speed in m/s (0 = overground).
 DEFAULT_TREADMILL_SPEED = 0
 
-# Repetition index for squats/STS (None = not segmented by rep).
+# Repetition index for squats/STS. Must stay None: see parse_args.
 DEFAULT_REPETITION = None
 
 # Time range to analyse. Both None = auto-detect from the kinematics .mot.
@@ -86,23 +94,6 @@ ANALYZE_RESULTS = True
 # Path to the data folder where OpenCapData_* sessions are.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FOLDER = BASE_DIR
-
-
-def build_windows(start_time, end_time, step=1.0, min_last_duration=0.5):
-    """Build 1-second sliding windows, merging a trailing window < 0.5 s.
-
-    Returns a list of [start, end] pairs.
-    """
-    starts = np.arange(start_time, end_time, step)
-    windows = [[float(s), min(float(s) + step, end_time)] for s in starts]
-
-    if len(windows) > 1:
-        last_dur = windows[-1][1] - windows[-1][0]
-        if 0 < last_dur < min_last_duration:
-            windows[-2][1] = windows[-1][1]
-            windows.pop()
-
-    return windows
 
 
 def archive_existing_outputs(dyn_dir):
@@ -254,12 +245,25 @@ def parse_args(argv=None):
                         help="Treadmill speed in m/s (0 = overground). "
                              "[default: %(default)s]")
     parser.add_argument("--repetition", type=int, default=DEFAULT_REPETITION,
-                        help="Repetition index for squats/STS. "
-                             "[default: %(default)s]")
+                        help="Not supported by the windowed pipeline; passing "
+                             "it exits with an error.")
     parser.add_argument("--only-missing", action="store_true",
                         help="Re-run only windows that previously failed "
                              "(skips converged ones per window_manifest).")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    # Rejected before anything touches the disk. processInputsOpenSimAD would
+    # replace every window's interval with times_window[repetition], so all
+    # workers would solve the same interval, and run_tracking would write to
+    # Dynamics/<trial>_rep<N>, which this script never reads.
+    if args.repetition is not None:
+        parser.error(
+            "--repetition is not supported by the windowed pipeline: "
+            "repetition segmentation replaces every window's interval with "
+            "that one repetition and writes results to "
+            "Dynamics/<trial>_rep<N>, which this script never reads. "
+            "Omit --repetition.")
+    return args
 
 
 def main(argv=None):
@@ -283,6 +287,7 @@ def main(argv=None):
     from pipeline_io import TrialSpec, WindowResult
     from parallel_config import compute_worker_count, merge_optimaltrajectories
     from utilsOpenSimAD import processInputsOpenSimAD
+    from mainOpenSimAD import run_tracking
 
     session_id = "OpenCapData_" + args.session_uuid
     spec = TrialSpec(
@@ -328,25 +333,33 @@ def main(argv=None):
         print("\nNothing to run (all windows already converged).")
         return
 
-    # --- Serial warm-up: build the C++ external function ONCE before any
-    # parallelism. buildExternalFunction writes to repo-global scratch paths, so
-    # concurrent first builds corrupt each other. One serial
-    # processInputsOpenSimAD call builds it, or early-returns if already built;
-    # every worker then only READS the cached per-session function. This also
-    # primes the adjusted model and contact geometry. It does NOT prime the
-    # muscle-tendon parameters or the polynomial coefficients - those are built
-    # inside run_tracking and are serialised by SharedPrepLock instead; see the
-    # module docstring.
-    warm_i, (warm_s, warm_e) = run_list[0]
-    print(f"\nWarm-up: building/loading external function via "
-          f"processInputsOpenSimAD on window {warm_i} "
-          f"[{warm_s:.2f}, {warm_e:.2f}] ...")
-    processInputsOpenSimAD(
-        spec.baseDir, spec.dataFolder, spec.session_id, spec.trial_name,
-        spec.motion_type, [warm_s, warm_e], spec.repetition,
-        spec.treadmill_speed, spec.contact_side, use_local_data=True,
-    )
-    print("Warm-up complete - external function is built and cached.")
+    # --- Serial prep pass, before any parallelism, over EVERY window in index
+    # order (including ones --only-missing skips). This does on disk exactly
+    # what a sequential run does before each window's solve:
+    #   - the first processInputsOpenSimAD call builds the adjusted model, the
+    #     contact model and the C++ external function (repo-global scratch
+    #     paths: concurrent builds corrupt each other); later calls return
+    #     early;
+    #   - run_tracking(prepOnly=True) builds the muscle-tendon parameters, the
+    #     trial's adjusted dummy motion and the polynomial data if a window
+    #     needs them and they are missing, then returns before the problem is
+    #     formulated.
+    # A window's solve never writes these caches, so after this pass every
+    # worker finds exactly what the sequential run would have found.
+    print(f"\nPrep pass: building shared inputs serially for {len(windows)} "
+          f"window(s) in index order ...")
+    for i, (win_start, win_end) in enumerate(windows):
+        settings = processInputsOpenSimAD(
+            spec.baseDir, spec.dataFolder, spec.session_id, spec.trial_name,
+            spec.motion_type, [win_start, win_end], spec.repetition,
+            spec.treadmill_speed, spec.contact_side, use_local_data=True,
+        )
+        run_tracking(
+            spec.baseDir, spec.dataFolder, spec.session_id, settings,
+            case=pipeline_io.case_name(spec.trial_name, i),
+            solveProblem=False, analyzeResults=False, prepOnly=True,
+        )
+    print("Prep pass complete - external function and model caches are built.")
 
     # --- Size the worker pool from available RAM (spare ~1 GB, ~2 GB/worker).
     available = psutil.virtual_memory().available

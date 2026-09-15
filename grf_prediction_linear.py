@@ -1,40 +1,31 @@
+# %% Sequential reference for the windowed GRF pipeline.
+# Solves the same 1-second windows as 02_run_grf_simulation.py, one after
+# another in this process, with the same processInputsOpenSimAD / run_tracking
+# calls. Use it to check that the parallel pipeline reproduces these results.
+#
+# Usage:
+#     python grf_prediction_linear.py [--trial-name TRIAL] [--motion-type TYPE]
+
 # %% Directories, paths, and imports. You should not need to change anything.
+import argparse
 import os
 import sys
-import numpy as np
+
+# Pin each solve to one thread before CasADi/OpenSim load their threading
+# runtimes, exactly as 02_run_grf_simulation.py does, so both run the same
+# arithmetic.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import pandas as pd
 
-baseDir = os.getcwd()
+baseDir = os.path.dirname(os.path.abspath(__file__))
 opensimADDir = os.path.join(baseDir, 'UtilsDynamicSimulations', 'OpenSimAD')
 sys.path.append(baseDir)
 sys.path.append(opensimADDir)
 
+import pipeline_io
 from utilsOpenSimAD import processInputsOpenSimAD, plotResultsOpenSimAD
 from mainOpenSimAD import run_tracking
-
-def get_mot_time_range(mot_file_path):
-    with open(mot_file_path, 'r') as f:
-        # Skip header
-        for line in f:
-            if 'endheader' in line:
-                break
-        # Read the rest as data
-        times = []
-        for line in f:
-            if line.strip() == '':
-                continue
-            time_str = line.split()[0]
-            try:
-                times.append(float(time_str))
-            except ValueError:
-                continue
-        if times:
-            return min(times), max(times)
-        else:
-            return None, None
-
-# List to store paths of generated GRF files
-grf_file_paths = []
 
 def read_mot_file_to_df(file_path):
     """Reads a .mot file into a pandas DataFrame."""
@@ -49,7 +40,7 @@ def read_mot_file_to_df(file_path):
                     in_header = False
             else:
                 data_lines.append(line)
-    
+
     # Extract column names from header (the line after 'endheader')
     column_names_line = [line for line in header_lines if 'endheader' in line][0]
     column_names_index = header_lines.index(column_names_line) + 1
@@ -58,7 +49,7 @@ def read_mot_file_to_df(file_path):
     # Read data into a DataFrame
     # Ensure data lines are not empty and contain numerical data
     valid_data_lines = [line.strip().split() for line in data_lines if line.strip() and not line.strip().startswith(';')] # Also ignore comment lines
-    
+
     if not valid_data_lines:
         return pd.DataFrame(columns=column_names)
 
@@ -84,13 +75,23 @@ def concatenate_grf_files(file_paths):
     concatenated_df = concatenated_df.sort_values(by='time').drop_duplicates(subset=['time'])
     return concatenated_df
 
+def write_df_to_mot(df, output_path):
+    """Write a DataFrame to a minimal .mot file."""
+    with open(output_path, 'w') as f:
+        f.write(f'name {os.path.basename(output_path)}\n')
+        f.write(f'datarows {len(df)}\n')
+        f.write(f'datacolumns {len(df.columns)}\n')
+        f.write(f'range {df["time"].min()} {df["time"].max()}\n')
+        f.write('endheader\n')
+        f.write('\t'.join(df.columns) + '\n')
+        df.to_csv(f, sep='\t', index=False, header=False)
+
 
 # User Inputs
 session_id = "OpenCapData_ab7eb7cf-817d-4035-a30b-ee68773906cb"
-trial_name = 'Suhasno_2'
-session_type = 'overground'
-motion_type = "walking"
 repetition = None
+treadmill_speed = 0
+contact_side = 'all'
 # Set to True to solve the optimal control problem.
 solveProblem = True
 # Set to True to analyze the results of the optimal control problem. If you
@@ -103,68 +104,73 @@ analyzeResults = True
 # Path to where you want the data to be downloaded.
 dataFolder = baseDir # Set dataFolder to the base directory
 
-sessionFolder =  os.path.join(dataFolder, session_id)
-pathTrial = os.path.join(sessionFolder, 'OpenSimData', 'Kinematics', trial_name + '.mot') 
-start_time, end_time = get_mot_time_range(pathTrial)
 
-if start_time is not None and end_time is not None:
-    window_starts = np.arange(start_time, end_time, 1.0)
-    window_ends = np.minimum(window_starts + 1.0, end_time)
-    windows = list(zip(window_starts, window_ends))
-else:
-    windows = []
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Sequential reference for the windowed GRF pipeline: "
+                    "solves the same windows as 02_run_grf_simulation.py, one "
+                    "after another.")
+    parser.add_argument("--trial-name", default="Suhasno_1",
+                        help="Trial (kinematics .mot stem) to simulate. "
+                             "[default: %(default)s]")
+    parser.add_argument("--motion-type", default="walking",
+                        help="Motion type, as in 02. [default: %(default)s]")
+    return parser.parse_args(argv)
 
-for i, (win_start, win_end) in enumerate(windows):
-    current_time_window = [win_start, win_end]
-    current_case = f'{trial_name}_window_{i}'
 
-    print(f"Processing window: {current_time_window} with case: {current_case}")
+def main(argv=None):
+    args = parse_args(argv)
+    trial_name = args.trial_name
+    motion_type = args.motion_type
 
-    # %% Setup.
-    if not 'repetition' in locals():
-        repetition = None
-    if not 'treadmill_speed' in locals():
-        treadmill_speed = 0
-    if not 'contact_side' in locals():
-        contact_side = 'all'
-    
-    settings = processInputsOpenSimAD(baseDir, dataFolder, session_id, trial_name,
-                                      motion_type, current_time_window, repetition,
-                                      treadmill_speed, contact_side, use_local_data=True)
-    
-    # %% Simulation.
-    run_tracking(baseDir, dataFolder, session_id, settings, case=current_case,
-                  solveProblem=solveProblem, analyzeResults=analyzeResults)
-    
-    # Store the path to the generated GRF resultant file
-    grf_file_paths.append(os.path.join(
-        dataFolder, session_id, 'OpenSimData', 'DynamicSimulations', trial_name,
-        f'GRF_resultant_{trial_name}_{current_case}.mot'))
+    dyn_dir = pipeline_io.dynamics_dir(dataFolder, session_id, trial_name)
+    pathTrial = pipeline_io.kinematics_mot(dataFolder, session_id, trial_name)
+    # Same time-range reader and same windowing (including the merge of a
+    # short trailing window) as 02, so both solve identical intervals.
+    start_time, end_time = pipeline_io.mot_time_range(pathTrial)
 
-# Concatenate all GRF files
-print("Concatenating GRF files...")
-full_grf_data = concatenate_grf_files(grf_file_paths)
-print(f"Concatenated GRF data shape: {full_grf_data.shape}")
+    if start_time is not None and end_time is not None:
+        windows = pipeline_io.build_windows(start_time, end_time)
+    else:
+        windows = []
 
-# Optional: Save the full GRF data to a new .mot file
-output_grf_file = os.path.join(
-    dataFolder, session_id, 'OpenSimData', 'DynamicSimulations', trial_name,
-    f'GRF_resultant_{trial_name}_full.mot')
+    # List to store paths of generated GRF files
+    grf_file_paths = []
 
-if not full_grf_data.empty:
-    # Define helper function to write dataframe to .mot file format
-    def write_df_to_mot(df, output_path):
-        with open(output_path, 'w') as f:
-            # Write header information (minimal for now, can be expanded)
-            f.write(f'name {os.path.basename(output_path)}\n')
-            f.write(f'datarows {len(df)}\n')
-            f.write(f'datacolumns {len(df.columns)}\n')
-            f.write(f'range {df['time'].min()} {df['time'].max()}\n')
-            f.write('endheader\n')
-            f.write('\t'.join(df.columns) + '\n')
-            df.to_csv(f, sep='\t', index=False, header=False)
+    for i, (win_start, win_end) in enumerate(windows):
+        current_time_window = [win_start, win_end]
+        current_case = pipeline_io.case_name(trial_name, i)
 
-    write_df_to_mot(full_grf_data, output_grf_file)
-    print(f"Full GRF data saved to: {output_grf_file}")
-else:
-    print("No GRF data to save.")
+        print(f"Processing window: {current_time_window} with case: {current_case}")
+
+        # %% Setup.
+        settings = processInputsOpenSimAD(baseDir, dataFolder, session_id, trial_name,
+                                          motion_type, current_time_window, repetition,
+                                          treadmill_speed, contact_side, use_local_data=True)
+
+        # %% Simulation.
+        run_tracking(baseDir, dataFolder, session_id, settings, case=current_case,
+                      solveProblem=solveProblem, analyzeResults=analyzeResults)
+
+        # Store the path to the generated GRF resultant file
+        grf_file_paths.append(
+            pipeline_io.grf_resultant_path(dyn_dir, trial_name, current_case))
+
+    # Concatenate all GRF files
+    print("Concatenating GRF files...")
+    full_grf_data = concatenate_grf_files(grf_file_paths)
+    print(f"Concatenated GRF data shape: {full_grf_data.shape}")
+
+    # Optional: Save the full GRF data to a new .mot file
+    output_grf_file = os.path.join(
+        dyn_dir, f'GRF_resultant_{trial_name}_full.mot')
+
+    if not full_grf_data.empty:
+        write_df_to_mot(full_grf_data, output_grf_file)
+        print(f"Full GRF data saved to: {output_grf_file}")
+    else:
+        print("No GRF data to save.")
+
+
+if __name__ == "__main__":
+    main()

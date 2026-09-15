@@ -12,7 +12,29 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 import pandas as pd
+
+
+# %% Windowing.
+
+def build_windows(start_time, end_time, step=1.0, min_last_duration=0.5):
+    """Build 1-second sliding windows, merging a trailing window < 0.5 s.
+
+    Shared by `02_run_grf_simulation.py` and `grf_prediction_linear.py` so the
+    parallel pipeline and its sequential reference solve exactly the same
+    intervals. Returns a list of [start, end] pairs.
+    """
+    starts = np.arange(start_time, end_time, step)
+    windows = [[float(s), min(float(s) + step, end_time)] for s in starts]
+
+    if len(windows) > 1:
+        last_dur = windows[-1][1] - windows[-1][0]
+        if 0 < last_dur < min_last_duration:
+            windows[-2][1] = windows[-1][1]
+            windows.pop()
+
+    return windows
 
 
 # %% Session folder layout.

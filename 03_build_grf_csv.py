@@ -6,6 +6,10 @@ converged windows, concatenates them (sorted by time, duplicates removed),
 exports a single CSV, a coverage sidecar JSON, and optionally plots the 6
 ground reaction force components.
 
+Coverage is measured from the samples actually exported, not from the window
+bounds the manifest requested, so the sidecar never claims time the CSV does
+not contain.
+
 Prerequisites:
     - 02_run_grf_simulation.py has already been run, producing
       window_manifest_<trial_name>.json under OpenSimData/Dynamics/<trial_name>/.
@@ -27,6 +31,7 @@ import argparse
 import json
 import os
 
+import numpy as np
 import pandas as pd
 
 import pipeline_io
@@ -103,30 +108,57 @@ def concatenate_grf_frames(frames):
               .drop_duplicates(subset=["time"]))
 
 
-def merge_time_ranges(windows):
+def exported_spans(loaded):
+    """First and last exported sample time of each loaded window.
+
+    These, not the manifest's requested bounds, are what coverage is built
+    from: run_tracking exports every mesh point but the last, and
+    processInputsOpenSimAD may clamp a window to the motion file, so the
+    requested bounds can claim time the CSV does not contain.
+    """
+    return [{"time_start": float(df["time"].min()),
+             "time_end": float(df["time"].max())}
+            for _, df in loaded if not df.empty]
+
+
+def contiguity_tolerance(times):
+    """Largest spacing still treated as contiguous: 1.5 sample intervals.
+
+    Consecutive windows are one sample interval apart (each drops its last
+    mesh point), so they must merge; a missing window leaves a gap far wider.
+    """
+    steps = np.diff(np.sort(np.asarray(times, dtype=float)))
+    steps = steps[steps > _TIME_EPS]
+    return 1.5 * float(np.median(steps)) if steps.size else _TIME_EPS
+
+
+def merge_time_ranges(windows, tol=_TIME_EPS):
     """Collapse window [time_start, time_end] spans into contiguous ranges.
 
-    Returns a list of ``[start, end]`` pairs, sorted, with touching or
-    overlapping windows merged into one.
+    Returns a list of ``[start, end]`` pairs, sorted, with windows that
+    overlap, touch, or are at most ``tol`` apart merged into one.
     """
     ranges = []
     for w in sorted(windows, key=lambda w: w["time_start"]):
-        if ranges and w["time_start"] <= ranges[-1][1] + _TIME_EPS:
+        if ranges and w["time_start"] <= ranges[-1][1] + tol:
             ranges[-1][1] = max(ranges[-1][1], w["time_end"])
         else:
             ranges.append([w["time_start"], w["time_end"]])
     return ranges
 
 
-def compute_gaps(valid_ranges, kin_start, kin_end):
-    """Return the parts of [kin_start, kin_end] not covered by valid_ranges."""
+def compute_gaps(valid_ranges, kin_start, kin_end, tol=_TIME_EPS):
+    """Return the parts of [kin_start, kin_end] not covered by valid_ranges.
+
+    Uncovered stretches no longer than ``tol`` are not reported.
+    """
     gaps = []
     cursor = kin_start
     for vs, ve in valid_ranges:
-        if vs > cursor + _TIME_EPS:
+        if vs > cursor + tol:
             gaps.append([cursor, vs])
         cursor = max(cursor, ve)
-    if cursor < kin_end - _TIME_EPS:
+    if cursor < kin_end - tol:
         gaps.append([cursor, kin_end])
     return gaps
 
@@ -239,8 +271,9 @@ def main(argv=None):
         kin_start = float(grf_df["time"].min())
         kin_end = float(grf_df["time"].max())
 
-    valid_ranges = merge_time_ranges([w for w, _ in loaded])
-    gaps = compute_gaps(valid_ranges, kin_start, kin_end)
+    tol = contiguity_tolerance(grf_df["time"])
+    valid_ranges = merge_time_ranges(exported_spans(loaded), tol)
+    gaps = compute_gaps(valid_ranges, kin_start, kin_end, tol)
 
     total_valid = sum(ve - vs for vs, ve in valid_ranges)
     total_kin = kin_end - kin_start
