@@ -25,6 +25,7 @@ sys.path.append(opensimADDir)
 
 import pipeline_io
 from utilsOpenSimAD import processInputsOpenSimAD, plotResultsOpenSimAD
+from kinematicsQC import run_qc_pass, verify_qc_marker
 from mainOpenSimAD import run_tracking
 
 def read_mot_file_to_df(file_path):
@@ -125,6 +126,22 @@ def main(argv=None):
 
     dyn_dir = pipeline_io.dynamics_dir(dataFolder, session_id, trial_name)
     pathTrial = pipeline_io.kinematics_mot(dataFolder, session_id, trial_name)
+
+    # Trial-scope QC pass, before mot_time_range/build_windows are run below.
+    # Without this, a standalone run on a fresh session would solve
+    # uncorrected kinematics: the per-window processInputsOpenSimAD call
+    # further down only builds/reuses the contact model for that window's
+    # interval, it does not run the QC pass itself. Same sequence as
+    # 02_run_grf_simulation.py's trial-scope prep.
+    raw_start, raw_end = pipeline_io.mot_time_range(pathTrial)
+    trial_settings = processInputsOpenSimAD(
+        baseDir, dataFolder, session_id, trial_name, motion_type,
+        [raw_start, raw_end], repetition, treadmill_speed, contact_side,
+        use_local_data=True)
+    run_qc_pass(dataFolder, session_id, trial_name,
+                OpenSimModel=trial_settings['OpenSimModel'])
+    verify_qc_marker(dataFolder, session_id, trial_name)
+
     # Same time-range reader and same windowing (including the merge of a
     # short trailing window) as 02, so both solve identical intervals.
     start_time, end_time = pipeline_io.mot_time_range(pathTrial)

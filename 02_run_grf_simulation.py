@@ -201,6 +201,13 @@ def manifest_row(result, session_root):
         "failure_reason": result.failure_reason,
         "grf_resultant_path": grf_path,
         "solved_at": datetime.now(timezone.utc).isoformat(),
+        "mean_vertical_grf": result.mean_vertical_grf,
+        "peak_vertical_grf": result.peak_vertical_grf,
+        "min_clearance_m": result.min_clearance_m,
+        "frac_frames_within_5mm": result.frac_frames_within_5mm,
+        "dedrift_method": result.dedrift_method,
+        "dynamics_consistency_residual_N": result.dynamics_consistency_residual_N,
+        "flip_count": result.flip_count,
     }
 
 
@@ -287,6 +294,7 @@ def main(argv=None):
     from pipeline_io import TrialSpec, WindowResult
     from parallel_config import compute_worker_count, merge_optimaltrajectories
     from utilsOpenSimAD import processInputsOpenSimAD
+    from kinematicsQC import run_qc_pass, verify_qc_marker
     from mainOpenSimAD import run_tracking
 
     session_id = "OpenCapData_" + args.session_uuid
@@ -306,6 +314,25 @@ def main(argv=None):
     manifest_file = pipeline_io.manifest_path(
         DATA_FOLDER, session_id, spec.trial_name)
 
+    # --- Trial-scope QC pass, before any windows are cut. The QC pass needs
+    # the contact model, which only exists after processInputsOpenSimAD runs,
+    # so a trial-scope call must happen first; and it must run before
+    # resolve_time_range/build_windows so the trimmed trailing frame is gone
+    # before windows are cut from the (possibly shorter) QC'd kinematics. The
+    # window argument here only selects `settings` (irrelevant at this call
+    # site); its `timeInterval` is discarded in favor of the real windows
+    # built below from the post-QC kinematics.
+    raw_start, raw_end = pipeline_io.mot_time_range(spec.kinematics_mot)
+    trial_settings = processInputsOpenSimAD(
+        spec.baseDir, spec.dataFolder, spec.session_id, spec.trial_name,
+        spec.motion_type, [raw_start, raw_end], spec.repetition,
+        spec.treadmill_speed, spec.contact_side, use_local_data=True)
+    run_qc_pass(spec.dataFolder, spec.session_id, spec.trial_name,
+                OpenSimModel=trial_settings['OpenSimModel'])
+    qc = verify_qc_marker(spec.dataFolder, spec.session_id, spec.trial_name)
+    qc_marker = {'qc_version': qc['qc_version'],
+                 'kinematics_sha256': qc['kinematics_sha256']}
+
     start, end = resolve_time_range(spec.kinematics_mot, START_TIME, END_TIME)
     windows = build_windows(start, end)
     print(f"\nTotal windows: {len(windows)}")
@@ -313,15 +340,24 @@ def main(argv=None):
         print(f"  Window {i}: [{ws:.2f}, {we:.2f}]  ({we - ws:.2f} s)")
 
     # --only-missing: skip windows already marked converged in a prior manifest.
+    # A prior manifest's rows are only reusable when they were solved against
+    # the SAME kinematics this run is about to use (qc_marker match): rows
+    # solved against different kinematics cannot be merged into one CSV, so a
+    # marker mismatch invalidates the whole prior manifest rather than being
+    # merged window-by-window.
     previous = load_manifest(manifest_file) if args.only_missing else None
     skip_indices = set()
     if args.only_missing:
-        if previous:
+        if previous and previous.get("qc_marker") == qc_marker:
             skip_indices = {w["index"] for w in previous.get("windows", [])
                             if w.get("converged")}
             if skip_indices:
                 print(f"\n--only-missing: skipping {len(skip_indices)} "
                       f"already-converged window(s): {sorted(skip_indices)}")
+        elif previous:
+            print("\n--only-missing: kinematics changed under the prior "
+                  "manifest (qc_marker mismatch) - re-solving every window.")
+            previous = None
         else:
             print("\n--only-missing: no prior manifest found - running all windows.")
     else:
@@ -398,12 +434,30 @@ def main(argv=None):
         by_idx.update({r["index"]: r for r in rows})
         rows = [by_idx[k] for k in sorted(by_idx)]
 
+    # Thresholds are copied out of trial_settings into the manifest (rather
+    # than read from settingsOpenSimAD by 03) so that 03_build_grf_csv.py
+    # stays free of OpenSim/CasADi imports.
+    thresholds = {
+        key: trial_settings.get(key, default)
+        for key, default in (
+            ("peak_vertical_grf_bw_zero_max", 0.02),
+            ("mean_vertical_grf_bw_min", 0.20),
+            ("frac_frames_within_5mm_min", 0.20),
+            ("peak_vertical_grf_bw_max", 2.0),
+            ("clearance_gate_m", 0.005),
+            ("dynamics_residual_bw_fraction", 0.05),
+        )
+    }
+
     manifest = {
         "trial_name": spec.trial_name,
         "session_id": session_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "workers": workers,
         "windows": rows,
+        "qc_marker": qc_marker,
+        "mass_kg": trial_settings["mass_kg"],
+        "thresholds": thresholds,
     }
     os.makedirs(dyn_dir, exist_ok=True)
     with open(manifest_file, "w") as f:
