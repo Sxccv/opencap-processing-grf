@@ -433,6 +433,25 @@ def getPolynomialCoefficients(data4PolynomialFitting, joints,
             # Compute difference with model data.
             # Muscle-tendon lengths.
             muscle_muscleTendonLengths_poly = np.matmul(mat,coefficients)
+            # KNOWN BUG, DO NOT NAIVELY "FIX": the **2 below is outside
+            # np.mean, so this computes abs(mean(error)), not RMS -- positive
+            # and negative residuals cancel, and the 1.5 mm length criterion
+            # this feeds is far weaker than it claims. (The moment-arm
+            # calculation three lines below at 444-445 is correctly
+            # parenthesised: np.sqrt(np.mean((...)**2, axis=0)).)
+            # Correcting the parenthesisation in isolation makes the fitted
+            # model WORSE: only gasmed and glmax1 change order (both jump
+            # from order 4 to the order-9 cap), and that degrades max
+            # moment-arm error from 6.839 mm to 12.811 mm on the right side
+            # while length error barely moves. Moment arms, not
+            # muscle-tendon lengths, are what the optimizer actually
+            # consumes, so a formula fix that only tightens the length
+            # criterion is a net regression. Evidence:
+            # grf_fix_experiments/t4_rms_formula.py and
+            # grf_fix_experiments/t4b_fit_error_at_real_poses.py.
+            # A proper fix requires also changing the order search from
+            # "first order that passes" to "order that minimises moment-arm
+            # error", and handling glmax1 separately.
             muscleTendonLengths_diff_rms = np.sqrt(np.mean(
                     muscle_muscleTendonLengths - muscle_muscleTendonLengths_poly)**2)
             # Moment-arms.

@@ -191,3 +191,7 @@ GAP: [6.00, 7.30] s
 | `parallel_config.py` | Worker-count arithmetic and the serial merge of the trajectory aggregate |
 | `grf_prediction.py` | `solve_window` — runs one window and decides whether it converged. A library, not an entry point |
 | `UtilsDynamicSimulations/OpenSimAD/sharedPrepLockOpenSimAD.py` | The cross-process lock guarding `run_tracking`'s one-time model caches |
+
+## Polynomial fitting determinism
+
+When a trial's Qs fall outside the default ROM used to fit the muscle-tendon polynomials, `adjustBoundsAndDummyMotion` (`UtilsDynamicSimulations/OpenSimAD/utilsOpenSimAD.py`) generates a dummy motion to fit trial-specific polynomials against. That draw is made with a seeded generator, `np.random.default_rng(DUMMY_MOTION_SEED)`, not the unseeded global `np.random`. The seed is the module-level constant `DUMMY_MOTION_SEED = 0` next to that function. Changing it invalidates every cached `*_polynomial_*.npy` and changes solver output, since it changes which dummy motion the polynomials are fit against.
