@@ -31,7 +31,30 @@ import yaml
 import scipy.interpolate as interpolate
 import platform
 import copy
+import json
+import hashlib
 import pandas as pd
+
+# %% Helper.
+def _hash_bounds(bounds):
+    """Stable key for a bounds set: sorted keys, rounded values, sha256 prefix.
+
+    Keying the cached polynomial/dummy-motion artefacts by trial name is
+    wrong: adjustBoundsAndDummyMotion is called with overwriteDummyMotion=
+    False, so the FIRST out-of-bounds window of a trial creates
+    dummy_motion_<trialName>.mot and every later window in that trial
+    silently reuses it even if it violated a different joint. Keying by a
+    canonical hash of the effective bounds instead makes the cache correct
+    by construction: two windows only share an artefact when their bounds
+    are actually identical. Hashing a canonical JSON string (sorted keys,
+    rounded floats) rather than a dict repr matters because dict repr /
+    hash ordering is not guaranteed stable across processes -- a key that
+    is only accidentally reproducible is not a fix for a determinism
+    defect.
+    """
+    canon = json.dumps({k: {kk: round(float(vv), 6) for kk, vv in v.items()}
+                        for k, v in sorted(bounds.items())}, sort_keys=True)
+    return "bounds_" + hashlib.sha256(canon.encode()).hexdigest()[:12]
 
 # %% Settings.
 def run_tracking(baseDir, dataDir, subject, settings, case='0',
@@ -749,21 +772,43 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
     # used to define the polynomials. If not, adjust the polynomial bounds.
     from utilsOpenSimAD import checkQsWithinPolynomialBounds
     updated_bounds = checkQsWithinPolynomialBounds(
-        dataToTrack_Qs_nsc, polynomial_bounds, model_bounds, coordinates_toTrack_l)
+        dataToTrack_Qs_nsc, polynomial_bounds, model_bounds, coordinates_toTrack_l,
+        margin_deg=1.0)
     type_bounds_polynomials = 'default'
     if len(updated_bounds) > 0:
-        # Modify the values of polynomial_bounds based on the values in
-        # updated_bounds.  Also, create a dummy motion file specific to the
-        # trial being processed.
-        from utilsOpenSimAD import adjustBoundsAndDummyMotion
-        # Locked: the adjusted dummy motion is keyed by trial, not by window,
-        # so every window that exceeds the default ROM writes the same file --
-        # and the polynomial fit below reads it.
-        with SharedPrepLock(pathModelFolder):
-            polynomial_bounds, pathDummyMotion = adjustBoundsAndDummyMotion(
-                polynomial_bounds, updated_bounds, pathDummyMotion,
-                pathModelFolder, trialName, overwriteDummyMotion=False)
-        type_bounds_polynomials = trialName
+        # updated_bounds can come back non-empty (the raw Qs cleared the
+        # margin_deg=1.0 tolerance above) yet, once clamped into
+        # effective_bounds below, be identical to the defaults -- measured
+        # in 40 of 42 branch-triggering cases. Build effective_bounds and
+        # compare BEFORE calling adjustBoundsAndDummyMotion, because that
+        # function mutates polynomial_bounds in place, so the "did anything
+        # really change" check can't be made from its return value.
+        effective_bounds = copy.deepcopy(polynomial_bounds)
+        for u_b in updated_bounds:
+            for c_m in updated_bounds[u_b]:
+                effective_bounds[u_b][c_m] = updated_bounds[u_b][c_m]
+
+        if effective_bounds == polynomial_bounds:
+            # Nothing actually changed once clamped to model_bounds; stay on
+            # the deterministic default fit instead of forking a cache entry
+            # that would be identical to it anyway.
+            pass
+        else:
+            # Modify the values of polynomial_bounds based on the values in
+            # updated_bounds.  Also, create a dummy motion file specific to
+            # the effective bounds that triggered the refit.
+            from utilsOpenSimAD import adjustBoundsAndDummyMotion
+            # Key the cache by a hash of the effective bounds, not by trial
+            # name -- see _hash_bounds for why trial name is unsafe here.
+            bounds_key = _hash_bounds(effective_bounds)
+            # Locked: the adjusted dummy motion is keyed by bounds_key, so
+            # windows whose Qs clamp to different bounds get their own file
+            # -- and the polynomial fit below reads it.
+            with SharedPrepLock(pathModelFolder):
+                polynomial_bounds, pathDummyMotion = adjustBoundsAndDummyMotion(
+                    polynomial_bounds, updated_bounds, pathDummyMotion,
+                    pathModelFolder, bounds_key, overwriteDummyMotion=False)
+            type_bounds_polynomials = bounds_key
     
     from functionCasADiOpenSimAD import polynomialApproximation
     leftPolynomialJoints = [
