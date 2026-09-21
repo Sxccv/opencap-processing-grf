@@ -56,6 +56,28 @@ def kinematics_mot(dataFolder, session_id, trial_name):
                         "OpenSimData", "Kinematics", f"{trial_name}.mot")
 
 
+def markers_trc(dataFolder, session_id, trial_name):
+    """The trial's marker data — the QC pass's shared-time-base check."""
+    return os.path.join(session_dir(dataFolder, session_id),
+                        "MarkerData", f"{trial_name}.trc")
+
+
+def kinematics_raw_mot(dataFolder, session_id, trial_name):
+    """The pre-QC kinematics, preserved by the QC pass before it rewrites."""
+    return os.path.join(session_dir(dataFolder, session_id),
+                        "OpenSimData", "Kinematics", f"{trial_name}_raw.mot")
+
+
+def qc_sidecar_path(dataFolder, session_id, trial_name):
+    """The QC pass's sidecar, read back by `verify_qc_marker`."""
+    return os.path.join(session_dir(dataFolder, session_id),
+                        "OpenSimData", "Kinematics", f"{trial_name}_qc.json")
+
+
+def kinematics_activations_path(dyn_dir, trial_name, case):
+    return os.path.join(dyn_dir, f"kinematics_activations_{trial_name}_{case}.mot")
+
+
 def manifest_path(dataFolder, session_id, trial_name):
     """The window manifest 02 writes and 03 consumes."""
     return os.path.join(dynamics_dir(dataFolder, session_id, trial_name),
@@ -160,3 +182,10 @@ class WindowResult:
     grf_path: Optional[str] = None
     trajectories_path: Optional[str] = None
     failure_reason: Optional[str] = None
+    mean_vertical_grf: Optional[float] = None
+    peak_vertical_grf: Optional[float] = None
+    min_clearance_m: Optional[float] = None
+    frac_frames_within_5mm: Optional[float] = None
+    dedrift_method: Optional[str] = None
+    dynamics_consistency_residual_N: Optional[float] = None
+    flip_count: Optional[int] = None
