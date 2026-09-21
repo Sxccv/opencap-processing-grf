@@ -250,8 +250,26 @@ def get_setup(motion_type):
         'enableLimitTorques': True,
         'filter_Qs_toTrack': True,
         'cutoff_freq_Qs': 6,
-        'meshDensity': 20}
-    
+        'meshDensity': 20,
+        # A2 gate: peak vertical GRF below this fraction of BW means the
+        # window produced essentially nothing.
+        'peak_vertical_grf_bw_zero_max': 0.02,
+        # A2 gate: mean vertical GRF must reach at least this fraction of BW
+        # to count as grounded (paired with frac_frames_within_5mm_min below).
+        'mean_vertical_grf_bw_min': 0.20,
+        # A2 gate: fraction of frames within 5 mm of the ground required
+        # before a low mean vertical GRF is treated as a genuine contradiction.
+        'frac_frames_within_5mm_min': 0.20,
+        # A2 gate: peak vertical GRF above this fraction of BW is
+        # physiologically implausible.
+        'peak_vertical_grf_bw_max': 2.0,
+        # A2 gate: minimum contact-sphere clearance (m) above which a window
+        # is not physically groundable.
+        'clearance_gate_m': 0.005,
+        # F2 gate: dynamics consistency residual, as a fraction of body
+        # weight, above which a window is rejected regardless of IPOPT status.
+        'dynamics_residual_bw_fraction': 0.05}
+
     # This is a non-periodic walking formulation. It helps to start .5s before
     # and end .3 seconds after
     setups['walking_formulation1'] = {
