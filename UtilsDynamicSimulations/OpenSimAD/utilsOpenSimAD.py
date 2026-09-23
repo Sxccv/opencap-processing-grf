@@ -2349,7 +2349,6 @@ def processInputsOpenSimAD(baseDir, dataFolder, session_id, trial_name,
     
     # Get settings.
     settings = get_setup(motion_type)
-    print(f"Type of settings after get_setup: {type(settings)}") # DEBUG LINE
     # Add time to settings if not specified.
     pathMotionFile = os.path.join(sessionFolder, 'OpenSimData', 'Kinematics',
                                   trial_name + '.mot')

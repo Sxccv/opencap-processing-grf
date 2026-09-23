@@ -76,6 +76,12 @@ This workflow needs its own conda environment. The install steps above (Python 3
    conda activate .\opensim-env
    ```
    Do not call `opensim-env\python.exe` without activating first. Without activation, CasADi cannot load IPOPT (`Plugin 'ipopt' is not found`), and the error appears only after several minutes of setup.
+
+   If `conda activate` is not available in your shell (some non-interactive shells and CI runners never source `conda init`), the environment is still usable: it is registered as a path-based conda env, and `conda run -p` invokes it without activation:
+   ```bash
+   conda run -p ./opensim-env python -m pytest tests -q
+   ```
+   Verified: `casadi.nlpsol('s','ipopt',...)` loads through this invocation and returns `EXIT: Optimal Solution Found.`
 4. Check that OpenSim loads and that CasADi finds IPOPT:
    ```bash
    python -c "import opensim, casadi as ca; x=ca.SX.sym('x'); ca.nlpsol('s','ipopt',{'x':x,'f':x**2}); print('casadi', ca.__version__, 'opensim', opensim.__version__, 'IPOPT OK')"
@@ -195,3 +201,22 @@ GAP: [6.00, 7.30] s
 ## Polynomial fitting determinism
 
 When a trial's Qs fall outside the default ROM used to fit the muscle-tendon polynomials, `adjustBoundsAndDummyMotion` (`UtilsDynamicSimulations/OpenSimAD/utilsOpenSimAD.py`) generates a dummy motion to fit trial-specific polynomials against. That draw is made with a seeded generator, `np.random.default_rng(DUMMY_MOTION_SEED)`, not the unseeded global `np.random`. The seed is the module-level constant `DUMMY_MOTION_SEED = 0` next to that function. Changing it invalidates every cached `*_polynomial_*.npy` and changes solver output, since it changes which dummy motion the polynomials are fit against.
+
+## Fore-aft gravity bias from world-frame tilt
+
+The kinematics QC pass estimates a world-frame tilt (its `A5` measurement) and, from that, a horizontal GRF bias. Nothing downstream in this pipeline removes that bias. The physics is direct: if the reconstruction's vertical axis is off from true vertical by angle theta, the model's gravity vector is off by the same angle, and every horizontal GRF component the solve produces carries a systematic offset of `m * g * sin(theta)`, on top of whatever real horizontal force is present.
+
+These values are measured on this session, not constants of the method — a different session (or a re-run of the QC pass) will give different numbers. On this session's four walking trials:
+
+| Trial | `tilt_angle_deg_estimate` | `gravity_bias_N_estimate` |
+| --- | --- | --- |
+| Suhasno_1 | 2.32 | 23.0 |
+| Suhasno_2 | 2.58 | 25.6 |
+| Suhasno_3 | 1.88 | 18.6 |
+| Suhasno_4 | 2.42 | 24.0 |
+
+i.e. tilt 1.88-2.58 degrees, giving an estimated bias of 18.6-25.6 N. The vertical de-drift step corrects vertical GRF drift; it does not touch this horizontal bias, since the bias comes from the direction of gravity in the model frame, not from a vertical-channel drift.
+
+Per-trial measured values are written to the QC sidecar at `<session>/OpenSimData/Kinematics/<trial>_qc.json`, under `horizontal_drift`, with keys `tilt_angle_deg_estimate` and `gravity_bias_N_estimate`. `gravity_bias_N_estimate` is computed as `m * g * sin(theta)` using `mass_kg` as read from the session's `sessionMetadata.yaml` (58.0 kg for this session) — not the scaled OpenSim model's mass, which is 57.867 kg (body weight 567.5 N), since `generate_model_with_contacts` runs with `setPatellaMasstoZero=True`. The two masses differ by about 0.2% (under 0.1 N on these numbers), so this doesn't change any conclusion, but a reader hand-computing the bias from the model mass should expect a small mismatch against the sidecar value.
+
+The underlying cause of the tilt is not established. A real incline in the capture volume, a tilted world frame from the wall-mounted checkerboard used for extrinsic calibration, and a distance-dependent reconstruction error are all consistent with the measured values; nothing in the current data distinguishes between them.

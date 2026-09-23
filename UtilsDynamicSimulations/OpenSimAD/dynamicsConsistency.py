@@ -210,9 +210,3 @@ def window_mean_residual(model_path, trajectories_path, case):
         "residual_N": float(residual_N),
         "residual_pct_bw": float(residual_pct_bw),
     }
-
-
-def residual_against_export(model_path, trajectories_path, case):
-    """Convenience wrapper: returns (residual_N, residual_pct_bw)."""
-    result = window_mean_residual(model_path, trajectories_path, case)
-    return result["residual_N"], result["residual_pct_bw"]

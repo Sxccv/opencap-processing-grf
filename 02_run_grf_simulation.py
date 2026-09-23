@@ -21,12 +21,19 @@ Output:
 Usage:
     python 02_run_grf_simulation.py [--session-uuid UUID] [--trial-name TRIAL]
         [--motion-type TYPE] [--contact-side SIDE] [--treadmill-speed M/S]
-        [--only-missing]
+        [--only-missing] [--max-workers N]
 
     All flags optional - bare invocation uses the defaults in the config
     block below (session ab7eb7cf-817d-4035-a30b-ee68773906cb, trial Suhasno_1).
     --repetition is rejected: repetition segmentation replaces every window's
     interval with that one repetition, so it cannot be combined with windowing.
+
+    RAM reserve / worker cap:
+    --max-workers N caps the RAM/CPU-derived worker pool at N (default:
+    unset, no cap). The GRF_RESERVE_MIB environment variable (an integer
+    number of mebibytes) overrides how much RAM is kept free instead of
+    parallel_config.DEFAULT_RESERVE_BYTES; unset or invalid falls back to
+    that default (invalid values print a warning first).
 
 Runtime note:
     5-15 minutes per 1-second window. Windows are solved in parallel, sized to
@@ -60,6 +67,7 @@ import traceback
 from datetime import datetime, timezone
 
 from pipeline_io import build_windows  # noqa: F401  (also used by tests)
+from parallel_config import DEFAULT_RESERVE_BYTES, compute_worker_count
 
 # Configuration - module-level defaults, overridable via CLI flags. These are
 # read once, by parse_args(), and never reassigned.
@@ -94,6 +102,51 @@ ANALYZE_RESULTS = True
 # Path to the data folder where OpenCapData_* sessions are.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FOLDER = BASE_DIR
+
+
+def _reserve_bytes_from_env():
+    """RAM reserve (bytes) for the worker pool, from the GRF_RESERVE_MIB
+    environment variable (an integer number of mebibytes), falling back to
+    parallel_config.DEFAULT_RESERVE_BYTES.
+
+    Unset or empty: falls back silently (this is the normal case). Set but
+    not a valid positive integer: also falls back, but prints a warning,
+    since that is a misconfiguration rather than an intentional omission.
+    """
+    raw = os.environ.get("GRF_RESERVE_MIB")
+    if raw is None or raw.strip() == "":
+        return DEFAULT_RESERVE_BYTES
+
+    try:
+        mib = int(raw.strip())
+        if mib <= 0:
+            raise ValueError("must be positive")
+    except ValueError:
+        print(f"WARNING: GRF_RESERVE_MIB={raw!r} is not a valid positive "
+              f"integer (mebibytes); falling back to the default "
+              f"{DEFAULT_RESERVE_BYTES // 1024**2} MiB reserve.")
+        return DEFAULT_RESERVE_BYTES
+
+    return mib * 1024**2
+
+
+def _effective_worker_count(available_bytes, cpu_count, num_windows,
+                             reserve_bytes, max_workers=None):
+    """compute_worker_count's RAM/CPU-sized pool, additionally capped by
+    ``max_workers`` (an operator-supplied ceiling, e.g. --max-workers).
+
+    ``compute_worker_count`` itself is untouched - this only adds one more
+    ``min(...)`` term on top of what it returns.
+    """
+    workers = compute_worker_count(
+        available_bytes=available_bytes,
+        cpu_count=cpu_count,
+        num_windows=num_windows,
+        reserve_bytes=reserve_bytes,
+    )
+    if max_workers is not None:
+        workers = min(workers, max_workers)
+    return workers
 
 
 def archive_existing_outputs(dyn_dir):
@@ -257,7 +310,14 @@ def parse_args(argv=None):
     parser.add_argument("--only-missing", action="store_true",
                         help="Re-run only windows that previously failed "
                              "(skips converged ones per window_manifest).")
+    parser.add_argument("--max-workers", type=int, default=None,
+                        help="Cap the RAM/CPU-derived worker pool size at "
+                             "this many concurrent windows. [default: "
+                             "unset - no cap beyond RAM/CPU sizing]")
     args = parser.parse_args(argv)
+
+    if args.max_workers is not None and args.max_workers < 1:
+        parser.error("--max-workers must be >= 1.")
 
     # Rejected before anything touches the disk. processInputsOpenSimAD would
     # replace every window's interval with times_window[repetition], so all
@@ -292,7 +352,7 @@ def main(argv=None):
     import psutil
     import pipeline_io
     from pipeline_io import TrialSpec, WindowResult
-    from parallel_config import compute_worker_count, merge_optimaltrajectories
+    from parallel_config import merge_optimaltrajectories
     from utilsOpenSimAD import processInputsOpenSimAD
     from kinematicsQC import run_qc_pass, verify_qc_marker
     from mainOpenSimAD import run_tracking
@@ -397,17 +457,25 @@ def main(argv=None):
         )
     print("Prep pass complete - external function and model caches are built.")
 
-    # --- Size the worker pool from available RAM (spare ~1 GB, ~2 GB/worker).
+    # --- Size the worker pool from available RAM (reserve configurable via
+    # the GRF_RESERVE_MIB env var, ~2 GB/worker), then cap with --max-workers
+    # if the operator gave one.
     available = psutil.virtual_memory().available
     cpu_count = os.cpu_count() or 1
-    workers = compute_worker_count(
+    reserve_bytes = _reserve_bytes_from_env()
+    workers = _effective_worker_count(
         available_bytes=available,
         cpu_count=cpu_count,
         num_windows=len(run_list),
+        reserve_bytes=reserve_bytes,
+        max_workers=args.max_workers,
     )
+    cap_note = ("" if args.max_workers is None
+                else f", capped at {args.max_workers} by --max-workers")
     print(f"\nAvailable RAM: {available / 1024**3:.1f} GB  ->  {workers} "
-          f"parallel worker(s) (reserve 1 GB, ~2 GB/worker, "
-          f"{cpu_count} CPUs, {len(run_list)} windows to run).\n")
+          f"parallel worker(s) (reserve {reserve_bytes / 1024**3:.2f} GB "
+          f"[GRF_RESERVE_MIB], ~2 GB/worker, {cpu_count} CPUs, "
+          f"{len(run_list)} windows to run{cap_note}).\n")
 
     tasks = [(spec, i, window) for i, window in run_list]
     results = run_pool(tasks, workers)

@@ -1,0 +1,99 @@
+OpenSimModel: LaiUhlrich2022
+clearance_gate_m: 0.005
+contact_side: all
+coordinate_constraints:
+  pelvis_tx:
+    env_bound: 0.1
+  pelvis_ty:
+    env_bound: 0.1
+coordinates_toTrack:
+  ankle_angle_l:
+    weight: 10
+  ankle_angle_r:
+    weight: 10
+  arm_add_l:
+    weight: 1
+  arm_add_r:
+    weight: 1
+  arm_flex_l:
+    weight: 1
+  arm_flex_r:
+    weight: 1
+  arm_rot_l:
+    weight: 1
+  arm_rot_r:
+    weight: 1
+  elbow_flex_l:
+    weight: 1
+  elbow_flex_r:
+    weight: 1
+  hip_adduction_l:
+    weight: 1
+  hip_adduction_r:
+    weight: 1
+  hip_flexion_l:
+    weight: 10
+  hip_flexion_r:
+    weight: 10
+  hip_rotation_l:
+    weight: 1
+  hip_rotation_r:
+    weight: 1
+  knee_angle_l:
+    weight: 10
+  knee_angle_r:
+    weight: 10
+  lumbar_bending:
+    weight: 1
+  lumbar_extension:
+    weight: 10
+  lumbar_rotation:
+    weight: 1
+  pelvis_list:
+    weight: 1
+  pelvis_rotation:
+    weight: 1
+  pelvis_tilt:
+    weight: 10
+  pelvis_tx:
+    weight: 1
+  pelvis_ty:
+    weight: 1
+  pelvis_tz:
+    weight: 1
+  pro_sup_l:
+    weight: 1
+  pro_sup_r:
+    weight: 1
+  subtalar_angle_l:
+    weight: 1
+  subtalar_angle_r:
+    weight: 1
+cutoff_freq_Qs: 6
+dynamics_residual_bw_fraction: 0.05
+enableLimitTorques: true
+filter_Qs_toTrack: true
+frac_frames_within_5mm_min: 0.2
+height_m: 1.65
+ipopt_tolerance: 3
+mass_kg: 58.0
+mean_vertical_grf_bw_min: 0.2
+meshDensity: 20
+peak_vertical_grf_bw_max: 2.0
+peak_vertical_grf_bw_zero_max: 0.02
+timeInterval:
+- 0.0
+- 1.0
+treadmill_speed: 0
+trial_name: Suhasno_1
+useExpressionGraphFunction: true
+weights:
+  accelerationTrackingTerm: 50
+  activationDtTerm: 0.001
+  activationTerm: 1
+  armExcitationTerm: 0.001
+  forceDtTerm: 0.001
+  jointAccelerationTerm: 0.001
+  lumbarExcitationTerm: 0.001
+  positionTrackingTerm: 10
+  velocityTrackingTerm: 10

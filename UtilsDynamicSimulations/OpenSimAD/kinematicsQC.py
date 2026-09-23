@@ -66,7 +66,12 @@ from utilsOpenSimAD import filterDataFrame
 from pipeline_io import (kinematics_mot, kinematics_raw_mot, qc_sidecar_path,
                          markers_trc, session_dir, build_windows)
 
-QC_VERSION = 1
+# Bumped from 1 to 2: fixed the step4_constant formula (GRF_FIX_PLAN.md A1) to
+# take the max over ALL bin residuals, not just the positive ones, so a trial
+# already entirely below the floor no longer gets an unwanted 5 mm of extra
+# penetration. Every sidecar written under the old (buggy) rule is stale and
+# must be re-run; verify_qc_marker's qc_version check enforces that.
+QC_VERSION = 2
 
 # Coordinates common.UPPER_BODY names for the arm-flip experiments; kept as a
 # literal here so this module does not depend on grf_fix_experiments/common.py.
@@ -318,6 +323,18 @@ def _contiguous_runs(mask):
     return runs
 
 
+def _step4_constant(bin_residuals_after_step3):
+    """The mandatory de-drift constant: ``max(0, worst_bin_residual + 5 mm)``.
+
+    ``worst_bin_residual`` is the maximum over ALL bins (not just the
+    positive ones), so the highest bin lands 5 mm below the floor and a
+    trial whose bins are already all below the floor is left alone instead
+    of being pushed 5 mm deeper into the ground.
+    """
+    worst = float(np.max(bin_residuals_after_step3))
+    return max(0.0, worst + 0.005)
+
+
 # %% Public API.
 
 def run_qc_pass(dataFolder, session_id, trial_name,
@@ -539,11 +556,15 @@ def run_qc_pass(dataFolder, session_id, trial_name,
                                for t in bin_times])
 
     bin_residuals_after_step3 = bin_minima - value_bins
-    positive = bin_residuals_after_step3[bin_residuals_after_step3 > 0]
-    worst_positive = float(positive.max()) if len(positive) else 0.0
 
     # --- Step 10: mandatory constant, subtract (trend + shift) from pelvis_ty. ---
-    step4_constant = max(0.0, worst_positive + 0.005)
+    # shift = max(0, worst_bin_residual + 5 mm), where worst_bin_residual is
+    # the MAX OVER ALL BINS (not just the positive ones): the highest bin
+    # lands 5 mm below the floor, and a trial whose bins are already all
+    # below the floor (worst_bin_residual < -0.005) is left alone rather than
+    # being pushed 5 mm deeper -- that extra penetration would eat into the
+    # method-selector margin for no reason.
+    step4_constant = _step4_constant(bin_residuals_after_step3)
     bin_residuals_after_step4 = bin_residuals_after_step3 - step4_constant
 
     shift_per_frame = value_full + step4_constant
