@@ -6,6 +6,10 @@ converged windows, concatenates them (sorted by time, duplicates removed),
 exports a single CSV, a coverage sidecar JSON, and optionally plots the 6
 ground reaction force components.
 
+Coverage is measured from the samples actually exported, not from the window
+bounds the manifest requested, so the sidecar never claims time the CSV does
+not contain.
+
 Prerequisites:
     - 02_run_grf_simulation.py has already been run, producing
       window_manifest_<trial_name>.json under OpenSimData/Dynamics/<trial_name>/.
@@ -27,6 +31,7 @@ import argparse
 import json
 import os
 
+import numpy as np
 import pandas as pd
 
 import pipeline_io
@@ -84,13 +89,59 @@ def load_converged_windows(manifest, dataFolder, session_id):
     return loaded
 
 
-def warn_all_zero(loaded):
-    """Flag windows whose force components are all ~zero (no-contact solves)."""
-    for w, df in loaded:
-        available = [c for c in GRF_LABELS if c in df.columns]
-        if available and (df[available].abs().max() < 1e-3).all():
-            print(f"WARNING: window {w['index']} appears all-zero - "
-                  f"may be a degenerate no-contact solution.")
+def window_physio_flags(w, mass_kg, thresholds):
+    """A4's gates. Returns a list of reason strings; empty means valid."""
+    reasons = []
+    BW = mass_kg * 9.80665 if mass_kg is not None else None
+
+    peak = w.get("peak_vertical_grf")
+    mean = w.get("mean_vertical_grf")
+    frac_5mm = w.get("frac_frames_within_5mm")
+    min_clearance = w.get("min_clearance_m")
+
+    zero_max = thresholds.get("peak_vertical_grf_bw_zero_max", 0.02)
+    mean_min = thresholds.get("mean_vertical_grf_bw_min", 0.20)
+    frac_min = thresholds.get("frac_frames_within_5mm_min", 0.20)
+    peak_max = thresholds.get("peak_vertical_grf_bw_max", 2.0)
+    clearance_gate = thresholds.get("clearance_gate_m", 0.005)
+
+    # Test 1: peak vertical GRF below this fraction of BW produced nothing.
+    if peak is not None and BW is not None:
+        if peak < zero_max * BW:
+            reasons.append(
+                f"peak vertical GRF {peak:.1f} N ({peak / BW:.3f}x BW) "
+                f"< {zero_max:.2f}x BW ({zero_max * BW:.1f} N) - "
+                f"produced nothing")
+
+    # Test 2: grounded (feet within 5mm often enough) but mean force too low
+    # to be real - a contradiction. Both conditions are required: a low mean
+    # force while the feet are genuinely airborne (test 4) is not this case.
+    if mean is not None and BW is not None and frac_5mm is not None:
+        if mean < mean_min * BW and frac_5mm >= frac_min:
+            reasons.append(
+                f"mean vertical GRF {mean:.1f} N ({mean / BW:.3f}x BW) "
+                f"< {mean_min:.2f}x BW ({mean_min * BW:.1f} N) while "
+                f"frac_frames_within_5mm {frac_5mm:.3f} >= {frac_min:.2f} - "
+                f"grounded but no force, a contradiction")
+
+    # Test 3: peak vertical GRF above this fraction of BW is implausible.
+    if peak is not None and BW is not None:
+        if peak > peak_max * BW:
+            reasons.append(
+                f"peak vertical GRF {peak:.1f} N ({peak / BW:.3f}x BW) "
+                f"> {peak_max:.2f}x BW ({peak_max * BW:.1f} N) - "
+                f"physiologically implausible")
+
+    # Test 4: the feet never get close enough to the ground to be groundable,
+    # independent of GRF magnitude - this is the test that catches a window
+    # whose mean/peak look plausible but whose feet are genuinely not down.
+    if min_clearance is not None:
+        if min_clearance > clearance_gate:
+            reasons.append(
+                f"min_clearance_m {min_clearance * 1000:.1f} mm > "
+                f"{clearance_gate * 1000:.1f} mm - not physically groundable")
+
+    return reasons
 
 
 def concatenate_grf_frames(frames):
@@ -103,30 +154,57 @@ def concatenate_grf_frames(frames):
               .drop_duplicates(subset=["time"]))
 
 
-def merge_time_ranges(windows):
+def exported_spans(loaded):
+    """First and last exported sample time of each loaded window.
+
+    These, not the manifest's requested bounds, are what coverage is built
+    from: run_tracking exports every mesh point but the last, and
+    processInputsOpenSimAD may clamp a window to the motion file, so the
+    requested bounds can claim time the CSV does not contain.
+    """
+    return [{"time_start": float(df["time"].min()),
+             "time_end": float(df["time"].max())}
+            for _, df in loaded if not df.empty]
+
+
+def contiguity_tolerance(times):
+    """Largest spacing still treated as contiguous: 1.5 sample intervals.
+
+    Consecutive windows are one sample interval apart (each drops its last
+    mesh point), so they must merge; a missing window leaves a gap far wider.
+    """
+    steps = np.diff(np.sort(np.asarray(times, dtype=float)))
+    steps = steps[steps > _TIME_EPS]
+    return 1.5 * float(np.median(steps)) if steps.size else _TIME_EPS
+
+
+def merge_time_ranges(windows, tol=_TIME_EPS):
     """Collapse window [time_start, time_end] spans into contiguous ranges.
 
-    Returns a list of ``[start, end]`` pairs, sorted, with touching or
-    overlapping windows merged into one.
+    Returns a list of ``[start, end]`` pairs, sorted, with windows that
+    overlap, touch, or are at most ``tol`` apart merged into one.
     """
     ranges = []
     for w in sorted(windows, key=lambda w: w["time_start"]):
-        if ranges and w["time_start"] <= ranges[-1][1] + _TIME_EPS:
+        if ranges and w["time_start"] <= ranges[-1][1] + tol:
             ranges[-1][1] = max(ranges[-1][1], w["time_end"])
         else:
             ranges.append([w["time_start"], w["time_end"]])
     return ranges
 
 
-def compute_gaps(valid_ranges, kin_start, kin_end):
-    """Return the parts of [kin_start, kin_end] not covered by valid_ranges."""
+def compute_gaps(valid_ranges, kin_start, kin_end, tol=_TIME_EPS):
+    """Return the parts of [kin_start, kin_end] not covered by valid_ranges.
+
+    Uncovered stretches no longer than ``tol`` are not reported.
+    """
     gaps = []
     cursor = kin_start
     for vs, ve in valid_ranges:
-        if vs > cursor + _TIME_EPS:
+        if vs > cursor + tol:
             gaps.append([cursor, vs])
         cursor = max(cursor, ve)
-    if cursor < kin_end - _TIME_EPS:
+    if cursor < kin_end - tol:
         gaps.append([cursor, kin_end])
     return gaps
 
@@ -218,14 +296,38 @@ def main(argv=None):
               "nothing to concatenate.")
         return
 
+    # A4's physiological gates, evaluated per converged window.
+    # `load_converged_windows` only means "IPOPT converged and the file is
+    # readable" - these gates are the honesty check on top of that.
+    mass_kg = manifest.get("mass_kg")
+    thresholds = manifest.get("thresholds", {})
+    flags_by_index = {w["index"]: window_physio_flags(w, mass_kg, thresholds)
+                      for w, _ in loaded}
+
     print(f"Using {len(loaded)} converged window(s) from manifest:")
     for w, _ in loaded:
+        reasons = flags_by_index[w["index"]]
+        flag_note = "  [FLAGGED]" if reasons else ""
         print(f"  window {w['index']}: [{w['time_start']:.2f}, "
-              f"{w['time_end']:.2f}]")
+              f"{w['time_end']:.2f}]{flag_note}")
+    for w, _ in loaded:
+        reasons = flags_by_index[w["index"]]
+        if reasons:
+            print(f"WARNING: window {w['index']} flagged invalid - "
+                  + "; ".join(reasons))
 
-    warn_all_zero(loaded)
+    # Tag every converged window's own rows with validity before
+    # concatenation, so every converged window's rows are kept in the CSV -
+    # flagged windows are marked, not dropped.
+    tagged_frames = []
+    for w, df in loaded:
+        reasons = flags_by_index[w["index"]]
+        tagged = df.copy()
+        tagged["valid"] = not reasons
+        tagged["flag_reason"] = "; ".join(reasons)
+        tagged_frames.append(tagged)
 
-    grf_df = concatenate_grf_frames([df for _, df in loaded])
+    grf_df = concatenate_grf_frames(tagged_frames)
     print(f"\nConcatenated DataFrame: {grf_df.shape[0]} rows x "
           f"{grf_df.shape[1]} columns")
     if grf_df.empty:
@@ -239,8 +341,24 @@ def main(argv=None):
         kin_start = float(grf_df["time"].min())
         kin_end = float(grf_df["time"].max())
 
-    valid_ranges = merge_time_ranges([w for w, _ in loaded])
-    gaps = compute_gaps(valid_ranges, kin_start, kin_end)
+    passing = [(w, df) for w, df in loaded if not flags_by_index[w["index"]]]
+    flagged = [(w, df) for w, df in loaded if flags_by_index[w["index"]]]
+
+    tol = contiguity_tolerance(grf_df["time"])
+    # Only passing windows contribute valid coverage; flagged spans become
+    # gaps even though their rows are still exported in the CSV.
+    valid_ranges = merge_time_ranges(exported_spans(passing), tol)
+    gaps = compute_gaps(valid_ranges, kin_start, kin_end, tol)
+
+    flagged_ranges = [
+        {
+            "index": w["index"],
+            "time_start": float(df["time"].min()),
+            "time_end": float(df["time"].max()),
+            "reasons": flags_by_index[w["index"]],
+        }
+        for w, df in flagged if not df.empty
+    ]
 
     total_valid = sum(ve - vs for vs, ve in valid_ranges)
     total_kin = kin_end - kin_start
@@ -254,6 +372,9 @@ def main(argv=None):
     if gaps:
         gaps_str = ", ".join(f"[{gs:.2f}, {ge:.2f}]" for gs, ge in gaps)
         print(f"GAP: {gaps_str} s")
+    if flagged_ranges:
+        print(f"FLAGGED: {len(flagged_ranges)} window(s) excluded from "
+              f"coverage - see flagged_ranges in the coverage sidecar.")
 
     stem = os.path.join(DATA_FOLDER, f"grf_df_{trial_name}_{session_id}")
 
@@ -266,6 +387,7 @@ def main(argv=None):
             "kinematics_time_range": [kin_start, kin_end],
             "valid_ranges": valid_ranges,
             "gap_ranges": gaps,
+            "flagged_ranges": flagged_ranges,
         }, f, indent=2)
     print(f"Coverage sidecar saved: {stem}_coverage.json")
 

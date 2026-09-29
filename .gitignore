@@ -14,4 +14,7 @@ UtilsDynamicSimulations/OpenSimAD/install-ExternalFunctionF*
 UtilsDynamicSimulations/OpenSimAD/opensimAD-install/*
 
 plans/
-tests/
+opensim-env/
+OpenCapData_82bfd477-2975-40e6-a6d2-bf7ed12a0abf/
+OpenCapData_ab7eb7cf-817d-4035-a30b-ee68773906cb/OpenSimData/Model/LaiUhlrich2022_scaled_adjusted.osim
+OpenCapData_ab7eb7cf-817d-4035-a30b-ee68773906cb/OpenSimData/Model/LaiUhlrich2022_scaled_adjusted_contacts.osim

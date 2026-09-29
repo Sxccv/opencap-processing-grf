@@ -1,0 +1,33 @@
+{
+  "trial_name": "Suhasno_1",
+  "kinematics_time_range": [
+    0.0,
+    7.2833333
+  ],
+  "valid_ranges": [
+    [
+      0.0,
+      2.95
+    ],
+    [
+      4.0,
+      7.23199997
+    ]
+  ],
+  "gap_ranges": [
+    [
+      2.95,
+      4.0
+    ]
+  ],
+  "flagged_ranges": [
+    {
+      "index": 3,
+      "time_start": 3.0,
+      "time_end": 3.95,
+      "reasons": [
+        "peak vertical GRF 1644.6 N (2.892x BW) > 2.00x BW (1137.6 N) - physiologically implausible"
+      ]
+    }
+  ]
+}

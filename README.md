@@ -61,11 +61,37 @@ Estimating ground reaction forces for a whole trial in one optimal control probl
 
 Three scripts run in order. Each is independently re-runnable.
 
-## Prerequisites
+## Setup
 
-- The full install above, including the **Muscle-driven simulations** section — this workflow builds and runs the OpenSimAD external function.
-- `python -m pip install -r requirements.txt` (adds `psutil` for RAM sizing and `pytest`).
-- `.env` with `API_TOKEN` present. Run `python createAuthenticationEnvFile.py` once if you have not.
+This workflow needs its own conda environment. The install steps above (Python 3.11, OpenSim 4.5, CasADi from pip) do not work with it. `mainOpenSimAD.py` expects the output format of the conda-forge CasADi 3.5.5 build. The pip CasADi wheels (tested 3.5.5 to 3.8.0) return a different format, and the solve fails with `IndexError`. The environment below was tested on Windows with Python 3.9, OpenSim 4.4.1 and CasADi 3.5.5.
+
+1. Install [Miniforge](https://github.com/conda-forge/miniforge) or Anaconda. Install Visual Studio with the *Desktop development with C++* workload, as described in **Muscle-driven simulations** above. CMake comes with the environment.
+2. From the repo root, create the environment in `opensim-env/` (git-ignored). This takes about 15 minutes:
+   ```bash
+   conda env create -p ./opensim-env -f environment_windows.yml
+   ```
+   The `name: opensim-ad` line in the file is not used when you pass `-p`.
+3. Activate the environment. Do this in every new terminal, from the repo root. All commands below assume the environment is active:
+   ```bash
+   conda activate .\opensim-env
+   ```
+   Do not call `opensim-env\python.exe` without activating first. Without activation, CasADi cannot load IPOPT (`Plugin 'ipopt' is not found`), and the error appears only after several minutes of setup.
+
+   If `conda activate` is not available in your shell (some non-interactive shells and CI runners never source `conda init`), the environment is still usable: it is registered as a path-based conda env, and `conda run -p` invokes it without activation:
+   ```bash
+   conda run -p ./opensim-env python -m pytest tests -q
+   ```
+   Verified: `casadi.nlpsol('s','ipopt',...)` loads through this invocation and returns `EXIT: Optimal Solution Found.`
+4. Check that OpenSim loads and that CasADi finds IPOPT:
+   ```bash
+   python -c "import opensim, casadi as ca; x=ca.SX.sym('x'); ca.nlpsol('s','ipopt',{'x':x,'f':x**2}); print('casadi', ca.__version__, 'opensim', opensim.__version__, 'IPOPT OK')"
+   ```
+   Expected: `casadi 3.5.5 opensim 4.4.1 IPOPT OK`.
+5. Save your OpenCap API token. You need it only to download a session (step 1). The demo session `OpenCapData_ab7eb7cf-…` is committed with its kinematics, so you can run it without a token. To save a token, run this from the repo root and log in with your app.opencap.ai credentials:
+   ```bash
+   python createAuthenticationEnvFile.py
+   ```
+   This adds `API_TOKEN="<token>"` to `.env` in the current folder. Run it from the repo root, because the scripts read `.env` from there. If `.env` already holds a token, the script does nothing.
 
 ## 1. Download the session
 
@@ -98,20 +124,20 @@ A bare invocation uses the defaults in the config block at the top of the file. 
 | `--motion-type` | `walking` / `running` / `squats` / `sit_to_stand` | `walking` |
 | `--contact-side` | `all`, `left` or `right` | `all` |
 | `--treadmill-speed` | m/s; `0` means overground | `0` |
-| `--repetition` | Repetition index for squats and sit-to-stand | none |
+| `--repetition` | Not supported by the windowed pipeline; passing it exits with an error | none |
 | `--only-missing` | Re-run only windows that did not converge last time | off |
 
 ```bash
 python 02_run_grf_simulation.py --trial-name Suhasno_2 --motion-type running
 ```
 
-**What it does, in order.** It reads the trial's time range from the kinematics `.mot` and cuts it into 1-second windows, merging a trailing window shorter than 0.5 s into the one before it. Unless `--only-missing` is set, it moves any pre-existing output into `_archive_<timestamp>/` so a fresh run cannot be confused by stale files. It then builds the C++ external function **once, serially** — `buildExternalFunction` writes to repo-global scratch paths, so concurrent first builds corrupt each other. Only then does it start the pool.
+**What it does, in order.** It reads the trial's time range from the kinematics `.mot` and cuts it into 1-second windows, merging a trailing window shorter than 0.5 s into the one before it. Unless `--only-missing` is set, it moves any pre-existing output into `_archive_<timestamp>/` so a fresh run cannot be confused by stale files. It then runs a **serial prep pass**: for every window, in index order, it calls `processInputsOpenSimAD` and `run_tracking(..., prepOnly=True)`. The first call builds the C++ external function (`buildExternalFunction` writes to repo-global scratch paths, so concurrent first builds corrupt each other). The pass as a whole builds the muscle-tendon parameter, dummy-motion and polynomial caches in the session `Model/` folder in the same order a sequential run (`grf_prediction_linear.py`) would. Only then does it start the pool.
 
 **How many windows run at once.** `available_RAM − 1 GB reserve`, divided by 2 GB per worker, capped by the CPU count and by the number of windows, and never below 1. An IPOPT solve for one window plateaus around 1.7–2.0 GB. The chosen worker count is printed before the pool starts. `OMP_NUM_THREADS=1` is set in the parent process, so each solve stays single-threaded rather than every worker spawning a thread per core.
 
-The muscle-tendon parameter and polynomial caches in the session `Model/` folder cannot be primed by the warm-up — which polynomial variant a window needs depends on that window's own range of motion — so they are guarded by a cross-process file lock (`UtilsDynamicSimulations/OpenSimAD/sharedPrepLockOpenSimAD.py`). The first worker to reach that region builds them while the others wait, then everyone loads from disk.
+Which cache a window creates depends on that window's own range of motion. If the workers built them first-come-first-served, a different window could own a cache than in a sequential run, so the prep pass builds them all before any worker starts; workers only load them. The cross-process file lock (`UtilsDynamicSimulations/OpenSimAD/sharedPrepLockOpenSimAD.py`) stays around those regions as a safety net. It also serialises the joint-reaction analyses (`computeKAM` / `computeMCF`), which write scratch files into the `Dynamics/<trial>/` folder that every window shares.
 
-**Runtime: 5–15 minutes per window.** A 7-second trial is 7 windows.
+**Runtime: 5–15 minutes per window.** A 7-second trial is 7 windows. The first run for a session also builds the external function, which takes a few minutes. The build compiles C++ with Visual Studio. If `UtilsDynamicSimulations/OpenSimAD/opensimAD-install/` is missing, the build first downloads the OpenSimAD libraries (about 60 MB) from SourceForge.
 
 **Outputs**, under `OpenCapData_<uuid>/OpenSimData/Dynamics/<trial_name>/`:
 
@@ -129,12 +155,14 @@ A window counts as converged only if its stats file says `success`, the GRF file
 python 02_run_grf_simulation.py --only-missing
 ```
 
-**Solving a single window** — useful for a first smoke test as a full run takes a lot of time.
+**Solving a single window.** A full run takes a long time, so a single window makes a good first smoke test. These values have no flags. Set them in the config block at the top of `02_run_grf_simulation.py`, then run the script as usual:
 
 ```python
 START_TIME = 0.0
 END_TIME   = 1.0
 ```
+
+Set both back to `None` to solve the whole trial.
 
 ### 3. Build the CSV
 
@@ -169,3 +197,26 @@ GAP: [6.00, 7.30] s
 | `parallel_config.py` | Worker-count arithmetic and the serial merge of the trajectory aggregate |
 | `grf_prediction.py` | `solve_window` — runs one window and decides whether it converged. A library, not an entry point |
 | `UtilsDynamicSimulations/OpenSimAD/sharedPrepLockOpenSimAD.py` | The cross-process lock guarding `run_tracking`'s one-time model caches |
+
+## Polynomial fitting determinism
+
+When a trial's Qs fall outside the default ROM used to fit the muscle-tendon polynomials, `adjustBoundsAndDummyMotion` (`UtilsDynamicSimulations/OpenSimAD/utilsOpenSimAD.py`) generates a dummy motion to fit trial-specific polynomials against. That draw is made with a seeded generator, `np.random.default_rng(DUMMY_MOTION_SEED)`, not the unseeded global `np.random`. The seed is the module-level constant `DUMMY_MOTION_SEED = 0` next to that function. Changing it invalidates every cached `*_polynomial_*.npy` and changes solver output, since it changes which dummy motion the polynomials are fit against.
+
+## Fore-aft gravity bias from world-frame tilt
+
+The kinematics QC pass estimates a world-frame tilt (its `A5` measurement) and, from that, a horizontal GRF bias. Nothing downstream in this pipeline removes that bias. The physics is direct: if the reconstruction's vertical axis is off from true vertical by angle theta, the model's gravity vector is off by the same angle, and every horizontal GRF component the solve produces carries a systematic offset of `m * g * sin(theta)`, on top of whatever real horizontal force is present.
+
+These values are measured on this session, not constants of the method — a different session (or a re-run of the QC pass) will give different numbers. On this session's four walking trials:
+
+| Trial | `tilt_angle_deg_estimate` | `gravity_bias_N_estimate` |
+| --- | --- | --- |
+| Suhasno_1 | 2.32 | 23.0 |
+| Suhasno_2 | 2.58 | 25.6 |
+| Suhasno_3 | 1.88 | 18.6 |
+| Suhasno_4 | 2.42 | 24.0 |
+
+i.e. tilt 1.88-2.58 degrees, giving an estimated bias of 18.6-25.6 N. The vertical de-drift step corrects vertical GRF drift; it does not touch this horizontal bias, since the bias comes from the direction of gravity in the model frame, not from a vertical-channel drift.
+
+Per-trial measured values are written to the QC sidecar at `<session>/OpenSimData/Kinematics/<trial>_qc.json`, under `horizontal_drift`, with keys `tilt_angle_deg_estimate` and `gravity_bias_N_estimate`. `gravity_bias_N_estimate` is computed as `m * g * sin(theta)` using `mass_kg` as read from the session's `sessionMetadata.yaml` (58.0 kg for this session) — not the scaled OpenSim model's mass, which is 57.867 kg (body weight 567.5 N), since `generate_model_with_contacts` runs with `setPatellaMasstoZero=True`. The two masses differ by about 0.2% (under 0.1 N on these numbers), so this doesn't change any conclusion, but a reader hand-computing the bias from the model mass should expect a small mismatch against the sidecar value.
+
+The underlying cause of the tilt is not established. A real incline in the capture volume, a tilted world frame from the wall-mounted checkerboard used for extrinsic calibration, and a distance-dependent reconstruction error are all consistent with the measured values; nothing in the current data distinguishes between them.

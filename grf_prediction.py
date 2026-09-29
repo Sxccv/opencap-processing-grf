@@ -7,6 +7,7 @@ aggregate afterwards. A second orchestrator used to live here; it had none of
 those safeguards, so running it reproduced exactly the races the pool was built
 to avoid. It was removed — drive the pipeline through 02.
 """
+import json
 import os
 import sys
 import time
@@ -24,6 +25,7 @@ import pipeline_io
 from pipeline_io import TrialSpec, WindowResult  # noqa: F401  (re-exported)
 from utilsOpenSimAD import processInputsOpenSimAD
 from mainOpenSimAD import run_tracking
+import dynamicsConsistency
 
 
 def solve_window(spec, index, time_window):
@@ -60,10 +62,12 @@ def solve_window(spec, index, time_window):
                             return_status="exception",
                             failure_reason="exception during solve")
 
-    return _inspect_outputs(spec, index, time_window, case, dyn_dir, started_at)
+    return _inspect_outputs(spec, index, time_window, case, dyn_dir, started_at,
+                            settings)
 
 
-def _inspect_outputs(spec, index, time_window, case, dyn_dir, started_at):
+def _inspect_outputs(spec, index, time_window, case, dyn_dir, started_at,
+                     settings):
     """Decide whether this window actually converged, from what it left on disk.
 
     run_tracking writes stats_<case>.npy whether or not IPOPT converged, so the
@@ -81,11 +85,11 @@ def _inspect_outputs(spec, index, time_window, case, dyn_dir, started_at):
               f"{index}. Expected at {traj_file}")
         traj_file = None
 
-    def failed(reason, status="unknown"):
+    def failed(reason, status="unknown", **metrics):
         print(f"FAIL [{case}]: {reason}")
         return WindowResult(index, win_start, win_end, converged=False,
                             return_status=status, trajectories_path=traj_file,
-                            failure_reason=reason)
+                            failure_reason=reason, **metrics)
 
     if not os.path.exists(stats_file):
         return failed(f"no stats file — solver may not have run. "
@@ -106,9 +110,84 @@ def _inspect_outputs(spec, index, time_window, case, dyn_dir, started_at):
         return failed("GRF file predates this run (stale file from a prior "
                       "invocation — archived or deleted)", status)
 
+    # Metrics below are all "nice to have" for the manifest: a failure to
+    # compute any of them must never turn a genuinely converged window into a
+    # failure, so each block is independently wrapped and just prints a
+    # traceback on error, leaving that metric (and only that metric) at None.
+    metrics = {}
+
+    try:
+        grf_df = pipeline_io.read_mot(grf_file)
+        vy = (grf_df["ground_force_right_vy"] + grf_df["ground_force_left_vy"])
+        metrics["mean_vertical_grf"] = float(vy.mean())
+        metrics["peak_vertical_grf"] = float(vy.abs().max())
+    except Exception:
+        print(f"Warning [{case}]: failed to compute GRF metrics")
+        traceback.print_exc()
+
+    try:
+        qc_path = pipeline_io.qc_sidecar_path(
+            spec.dataFolder, spec.session_id, spec.trial_name)
+        with open(qc_path, "r") as f:
+            qc = json.load(f)
+        per_window = next(
+            (w for w in qc.get("per_window", []) if w.get("index") == index),
+            None)
+        if per_window is not None:
+            metrics["min_clearance_m"] = per_window.get("min_clearance_m")
+            metrics["frac_frames_within_5mm"] = per_window.get(
+                "frac_frames_within_5mm")
+        metrics["dedrift_method"] = qc.get("dedrift", {}).get("method")
+        metrics["flip_count"] = len(
+            qc.get("flip_detection", {}).get("multi_coordinate", {})
+            .get("frame_indices", []))
+    except Exception:
+        print(f"Warning [{case}]: failed to compute QC sidecar metrics")
+        traceback.print_exc()
+
+    residual_N = None
+    body_weight_N = None
+    if traj_file is not None:
+        # A missing/unreadable trajectories file leaves the residual None and
+        # skips the F2 gate below rather than failing the window.
+        try:
+            model_name = settings["OpenSimModel"]
+            model_path = os.path.join(
+                pipeline_io.session_dir(spec.dataFolder, spec.session_id),
+                "OpenSimData", "Model",
+                f"{model_name}_scaled_adjusted_contacts.osim")
+            dyn_result = dynamicsConsistency.window_mean_residual(
+                model_path, traj_file, case)
+            residual_N = dyn_result["residual_N"]
+            body_weight_N = dyn_result["body_weight_N"]
+            metrics["dynamics_consistency_residual_N"] = residual_N
+        except Exception:
+            print(f"Warning [{case}]: failed to compute dynamics consistency "
+                  f"residual")
+            traceback.print_exc()
+
+    # F2 gate: the pelvis is a floating base with no reserve actuators, so
+    # a window whose exported GRF cannot even balance its own exported
+    # kinematics (sum(GRF) far from m*(a_com+g)) is not physically usable no
+    # matter what IPOPT's return_status says. On the 2026-09-15 run,
+    # physically grounded windows measured 0.1-0.8% of body weight while
+    # ungrounded ones measured 12-62%, so 5% sits between the two
+    # populations with roughly 6x margin on each side. This only fires on a
+    # residual actually computed above -- never on a missing one.
+    if residual_N is not None and body_weight_N is not None:
+        threshold_frac = settings.get("dynamics_residual_bw_fraction", 0.05)
+        threshold_N = threshold_frac * body_weight_N
+        if abs(residual_N) > threshold_N:
+            return failed(
+                f"dynamics consistency residual {residual_N:.1f} N exceeds "
+                f"{threshold_frac * 100:.1f}% of body weight "
+                f"({threshold_N:.1f} N) -- overriding IPOPT "
+                f"return_status={status}",
+                status, **metrics)
+
     return WindowResult(index, win_start, win_end, converged=True,
                         return_status=status, grf_path=grf_file,
-                        trajectories_path=traj_file)
+                        trajectories_path=traj_file, **metrics)
 
 
 def solve_window_task(task):

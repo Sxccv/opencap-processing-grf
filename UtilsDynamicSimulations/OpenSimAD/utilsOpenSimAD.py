@@ -209,15 +209,22 @@ def getColfromk(xk, d, N):
     return xj
 
 # %% Verify if within range used for fitting polynomials.
-def checkQsWithinPolynomialBounds(data, bounds, model_bounds, coordinates):
-    
-    updated_bounds = {}    
+def checkQsWithinPolynomialBounds(data, bounds, model_bounds, coordinates,
+                                   margin_deg=1.0):
+
+    updated_bounds = {}
     for coord in coordinates:
         if coord in bounds:
             c_idc = coordinates.index(coord)
             c_data = data[c_idc, :]
-            # Small margin to account for filtering.                
-            if not np.all(c_data * 180 / np.pi <= bounds[coord]['max']):
+            # Small margin to account for filtering. The largest measured
+            # overshoot across all trials/windows is 0.588deg, caused by 6 Hz
+            # filtfilt ringing where the raw IK sits exactly on the model
+            # clamp. A 1deg margin absorbs that ringing so filtering noise
+            # doesn't nondeterministically trigger a trial-specific
+            # polynomial refit; tracking is a cost term, not a constraint,
+            # so the sub-degree slack this allows is not an infeasibility.
+            if not np.all(c_data * 180 / np.pi <= bounds[coord]['max'] + margin_deg):
                 print('WARNING: the {} coordinate values to track have values above the default upper bound ROM for polynomial fitting: {}deg >= {}deg'.format(coord, np.round(np.max(c_data) * 180 / np.pi, 2), np.round(bounds[coord]['max'], 2)))
                 new_bound = np.ceil(np.max(c_data) * 180 / np.pi)
                 if new_bound > model_bounds[coord]['max']:
@@ -225,7 +232,7 @@ def checkQsWithinPolynomialBounds(data, bounds, model_bounds, coordinates):
                     new_bound = model_bounds[coord]['max']
                 print('Upper bound set to: {}deg'.format(new_bound))
                 updated_bounds[coord] = {'max': new_bound}
-            if not np.all(c_data * 180 / np.pi >= bounds[coord]['min']):
+            if not np.all(c_data * 180 / np.pi >= bounds[coord]['min'] - margin_deg):
                 print('WARNING: the {} coordinate values to track have values below default lower bound ROM for polynomial fitting: {}deg <= {}deg'.format(coord, np.round(np.min(c_data) * 180 / np.pi, 2), np.round(bounds[coord]['min'], 2)))
                 new_bound = np.floor(np.min(c_data) * 180 / np.pi)
                 if new_bound < model_bounds[coord]['min']:
@@ -2342,7 +2349,6 @@ def processInputsOpenSimAD(baseDir, dataFolder, session_id, trial_name,
     
     # Get settings.
     settings = get_setup(motion_type)
-    print(f"Type of settings after get_setup: {type(settings)}") # DEBUG LINE
     # Add time to settings if not specified.
     pathMotionFile = os.path.join(sessionFolder, 'OpenSimData', 'Kinematics',
                                   trial_name + '.mot')
@@ -2395,15 +2401,19 @@ def processInputsOpenSimAD(baseDir, dataFolder, session_id, trial_name,
 
 # %% Adjust dummy_motion for polynomial fitting.
 
+# Seed for the dummy-motion draw below, documented in README.md; changing it
+# changes every fit (invalidates every cached *_polynomial_*.npy).
+DUMMY_MOTION_SEED = 0
+
 def adjustBoundsAndDummyMotion(polynomial_bounds, updated_bounds, pathDummyMotion, pathModelFolder, trialName,
                                overwriteDummyMotion=False):
     # Modify the values of polynomial_bounds based on the values in
-    # updated_bounds. 
+    # updated_bounds.
     for u_b in updated_bounds:
         for c_m in updated_bounds[u_b]:
             polynomial_bounds[u_b][c_m] = updated_bounds[u_b][c_m]
-            
-    pathAdjustedDummyMotion = os.path.join(pathModelFolder, 'dummy_motion_' + trialName + '.mot')    
+
+    pathAdjustedDummyMotion = os.path.join(pathModelFolder, 'dummy_motion_' + trialName + '.mot')
     # Generate dummy motion if not exists or if overwrite is True.
     if not os.path.exists(pathAdjustedDummyMotion) or overwriteDummyMotion:
         print('We are adjusting the ROM used for polynomial fitting, but please make sure that the motion to track looks realistic')
@@ -2411,10 +2421,21 @@ def adjustBoundsAndDummyMotion(polynomial_bounds, updated_bounds, pathDummyMotio
         coordinates_table_jointset = list(table.getColumnLabels())
         coordinates_table = [c.split('/')[3] for c in coordinates_table_jointset]
         data = table.getMatrix().to_numpy()
+        # Use an explicit, seeded generator rather than np.random.uniform
+        # (unseeded global state): np.random.seed would silently change any
+        # other consumer of np.random in the same process, and
+        # 02_run_grf_simulation.py's workers share a process tree. Created
+        # once, before the loop, so successive coordinates draw from one
+        # stream. Note default_rng(0).uniform and np.random.uniform draw
+        # different numbers, so this changes the fit once, by design.
+        rng = np.random.default_rng(DUMMY_MOTION_SEED)
         for u_b in updated_bounds:
             idx_u_b = coordinates_table.index(u_b)
-            data[:,idx_u_b] = (polynomial_bounds[u_b]["max"]-polynomial_bounds[u_b]["min"])*np.random.uniform(0.0,1.0,data.shape[0]) + polynomial_bounds[u_b]["min"]
-            
+            data[:, idx_u_b] = (
+                (polynomial_bounds[u_b]["max"] - polynomial_bounds[u_b]["min"])
+                * rng.uniform(0.0, 1.0, data.shape[0])
+                + polynomial_bounds[u_b]["min"])
+
         labels = ['time'] + coordinates_table_jointset
         t_dummy_motion = np.array(table.getIndependentColumn())
         t_dummy_motion = np.expand_dims(t_dummy_motion, axis=1)

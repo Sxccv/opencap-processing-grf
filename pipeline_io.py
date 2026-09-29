@@ -12,7 +12,29 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
 import pandas as pd
+
+
+# %% Windowing.
+
+def build_windows(start_time, end_time, step=1.0, min_last_duration=0.5):
+    """Build 1-second sliding windows, merging a trailing window < 0.5 s.
+
+    Shared by `02_run_grf_simulation.py` and `grf_prediction_linear.py` so the
+    parallel pipeline and its sequential reference solve exactly the same
+    intervals. Returns a list of [start, end] pairs.
+    """
+    starts = np.arange(start_time, end_time, step)
+    windows = [[float(s), min(float(s) + step, end_time)] for s in starts]
+
+    if len(windows) > 1:
+        last_dur = windows[-1][1] - windows[-1][0]
+        if 0 < last_dur < min_last_duration:
+            windows[-2][1] = windows[-1][1]
+            windows.pop()
+
+    return windows
 
 
 # %% Session folder layout.
@@ -32,6 +54,28 @@ def kinematics_mot(dataFolder, session_id, trial_name):
     """The trial's IK output — the pipeline's input, and its time range."""
     return os.path.join(session_dir(dataFolder, session_id),
                         "OpenSimData", "Kinematics", f"{trial_name}.mot")
+
+
+def markers_trc(dataFolder, session_id, trial_name):
+    """The trial's marker data — the QC pass's shared-time-base check."""
+    return os.path.join(session_dir(dataFolder, session_id),
+                        "MarkerData", f"{trial_name}.trc")
+
+
+def kinematics_raw_mot(dataFolder, session_id, trial_name):
+    """The pre-QC kinematics, preserved by the QC pass before it rewrites."""
+    return os.path.join(session_dir(dataFolder, session_id),
+                        "OpenSimData", "Kinematics", f"{trial_name}_raw.mot")
+
+
+def qc_sidecar_path(dataFolder, session_id, trial_name):
+    """The QC pass's sidecar, read back by `verify_qc_marker`."""
+    return os.path.join(session_dir(dataFolder, session_id),
+                        "OpenSimData", "Kinematics", f"{trial_name}_qc.json")
+
+
+def kinematics_activations_path(dyn_dir, trial_name, case):
+    return os.path.join(dyn_dir, f"kinematics_activations_{trial_name}_{case}.mot")
 
 
 def manifest_path(dataFolder, session_id, trial_name):
@@ -138,3 +182,10 @@ class WindowResult:
     grf_path: Optional[str] = None
     trajectories_path: Optional[str] = None
     failure_reason: Optional[str] = None
+    mean_vertical_grf: Optional[float] = None
+    peak_vertical_grf: Optional[float] = None
+    min_clearance_m: Optional[float] = None
+    frac_frames_within_5mm: Optional[float] = None
+    dedrift_method: Optional[str] = None
+    dynamics_consistency_residual_N: Optional[float] = None
+    flip_count: Optional[int] = None

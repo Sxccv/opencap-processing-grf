@@ -31,12 +31,35 @@ import yaml
 import scipy.interpolate as interpolate
 import platform
 import copy
+import json
+import hashlib
 import pandas as pd
+
+# %% Helper.
+def _hash_bounds(bounds):
+    """Stable key for a bounds set: sorted keys, rounded values, sha256 prefix.
+
+    Keying the cached polynomial/dummy-motion artefacts by trial name is
+    wrong: adjustBoundsAndDummyMotion is called with overwriteDummyMotion=
+    False, so the FIRST out-of-bounds window of a trial creates
+    dummy_motion_<trialName>.mot and every later window in that trial
+    silently reuses it even if it violated a different joint. Keying by a
+    canonical hash of the effective bounds instead makes the cache correct
+    by construction: two windows only share an artefact when their bounds
+    are actually identical. Hashing a canonical JSON string (sorted keys,
+    rounded floats) rather than a dict repr matters because dict repr /
+    hash ordering is not guaranteed stable across processes -- a key that
+    is only accidentally reproducible is not a fix for a determinism
+    defect.
+    """
+    canon = json.dumps({k: {kk: round(float(vv), 6) for kk, vv in v.items()}
+                        for k, v in sorted(bounds.items())}, sort_keys=True)
+    return "bounds_" + hashlib.sha256(canon.encode()).hexdigest()[:12]
 
 # %% Settings.
 def run_tracking(baseDir, dataDir, subject, settings, case='0',
                  solveProblem=True, analyzeResults=True, writeGUI=True,
-                 computeKAM=True, computeMCF=True):
+                 computeKAM=True, computeMCF=True, prepOnly=False):
     
     # %% Settings.
     # Most available settings are left from trying out different formulations 
@@ -367,9 +390,11 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
             trialName + '_rep' + str(settings['repetition']))     
     os.makedirs(pathResults, exist_ok=True)
     pathSettings = os.path.join(pathResults, 'Setup_{}.yaml'.format(case))
-    # Dump settings in yaml file.
-    with open(pathSettings, 'w') as file:
-        yaml.dump(settings, file)
+    # Dump settings in yaml file (not for a prep-only call, which solves
+    # nothing).
+    if not prepOnly:
+        with open(pathSettings, 'w') as file:
+            yaml.dump(settings, file)
     
     # %% Muscles.
     # This section specifies the muscles and some of their parameters. This is
@@ -747,21 +772,43 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
     # used to define the polynomials. If not, adjust the polynomial bounds.
     from utilsOpenSimAD import checkQsWithinPolynomialBounds
     updated_bounds = checkQsWithinPolynomialBounds(
-        dataToTrack_Qs_nsc, polynomial_bounds, model_bounds, coordinates_toTrack_l)
+        dataToTrack_Qs_nsc, polynomial_bounds, model_bounds, coordinates_toTrack_l,
+        margin_deg=1.0)
     type_bounds_polynomials = 'default'
     if len(updated_bounds) > 0:
-        # Modify the values of polynomial_bounds based on the values in
-        # updated_bounds.  Also, create a dummy motion file specific to the
-        # trial being processed.
-        from utilsOpenSimAD import adjustBoundsAndDummyMotion
-        # Locked: the adjusted dummy motion is keyed by trial, not by window,
-        # so every window that exceeds the default ROM writes the same file --
-        # and the polynomial fit below reads it.
-        with SharedPrepLock(pathModelFolder):
-            polynomial_bounds, pathDummyMotion = adjustBoundsAndDummyMotion(
-                polynomial_bounds, updated_bounds, pathDummyMotion,
-                pathModelFolder, trialName, overwriteDummyMotion=False)
-        type_bounds_polynomials = trialName
+        # updated_bounds can come back non-empty (the raw Qs cleared the
+        # margin_deg=1.0 tolerance above) yet, once clamped into
+        # effective_bounds below, be identical to the defaults -- measured
+        # in 40 of 42 branch-triggering cases. Build effective_bounds and
+        # compare BEFORE calling adjustBoundsAndDummyMotion, because that
+        # function mutates polynomial_bounds in place, so the "did anything
+        # really change" check can't be made from its return value.
+        effective_bounds = copy.deepcopy(polynomial_bounds)
+        for u_b in updated_bounds:
+            for c_m in updated_bounds[u_b]:
+                effective_bounds[u_b][c_m] = updated_bounds[u_b][c_m]
+
+        if effective_bounds == polynomial_bounds:
+            # Nothing actually changed once clamped to model_bounds; stay on
+            # the deterministic default fit instead of forking a cache entry
+            # that would be identical to it anyway.
+            pass
+        else:
+            # Modify the values of polynomial_bounds based on the values in
+            # updated_bounds.  Also, create a dummy motion file specific to
+            # the effective bounds that triggered the refit.
+            from utilsOpenSimAD import adjustBoundsAndDummyMotion
+            # Key the cache by a hash of the effective bounds, not by trial
+            # name -- see _hash_bounds for why trial name is unsafe here.
+            bounds_key = _hash_bounds(effective_bounds)
+            # Locked: the adjusted dummy motion is keyed by bounds_key, so
+            # windows whose Qs clamp to different bounds get their own file
+            # -- and the polynomial fit below reads it.
+            with SharedPrepLock(pathModelFolder):
+                polynomial_bounds, pathDummyMotion = adjustBoundsAndDummyMotion(
+                    polynomial_bounds, updated_bounds, pathDummyMotion,
+                    pathModelFolder, bounds_key, overwriteDummyMotion=False)
+            type_bounds_polynomials = bounds_key
     
     from functionCasADiOpenSimAD import polynomialApproximation
     leftPolynomialJoints = [
@@ -850,6 +897,15 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
                 data4PolynomialFitting, leftPolynomialJoints, leftSideMuscles,
                 f_polynomial['l'], polynomialData['l'], momentArmIndices)
     
+    # %% Prep only.
+    # With prepOnly, stop once the trial's shared Model-folder caches exist
+    # (muscle-tendon parameters, adjusted dummy motion, polynomial data). The
+    # windowed pipeline (02_run_grf_simulation.py) calls this serially, in
+    # window order, before its worker pool, so which window builds which cache
+    # matches a sequential run.
+    if prepOnly:
+        return
+
     # %% External functions.
     # The external function builds the OpenSim model and run inverse dynamics.
     # The function takes as inputs joint positions, velocities, and 
@@ -966,13 +1022,12 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
     # We use an orthogonal third-order radau collocation scheme.
     d = 3 # interpolating polynomial.
     tau = ca.collocation_points(d,'radau')
-    # collocation_interpolators returns the pair (C, D). C must stay the
-    # (d+1)x(d+1) nested list it comes back as: it is indexed row-wise as
-    # C[j+1] for j in range(d) below. Wrapping the pair as
-    # np.array(result[:-1]) instead yields shape (1, d+1, d+1) and makes C[1]
-    # an IndexError -- that form has been introduced and reverted twice in
-    # this file's history; do not reintroduce it.
-    [C, D] = ca.collocation_interpolators(tau)
+    # The conda-forge casadi 3.5.5 build pinned in environment_windows.yml
+    # returns one flat list of d+2 lists: the d+1 rows of C, then D. Unpacking
+    # it as [C, D] raises "too many values to unpack (expected 2)".
+    collocation_matrices = ca.collocation_interpolators(tau)
+    C = np.array(collocation_matrices[:-1])
+    D = np.array(collocation_matrices[-1])
 
     if d == 3:  
         B = [0, 0.376403062700467, 0.512485826188421, 0.111111111111111]
@@ -2525,12 +2580,16 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
                 'kinematics_activations_{}_{}.mot'.format(trialName, case))
             GRFPath = os.path.join(
                 pathResults, 'GRF_{}_{}.mot'.format(trialName, case))
-            c_KAM = computeKAM(pathGenericTemplates,
-                               pathResults, pathModelFile, IDPath, 
-                               IKPath, GRFPath, grfType='sphere',
-                               contactSides=contactSides,
-                               contactSpheres=contactSpheres,
-                               Qds=Qds_opt_nsc.T)
+            # Locked: computeKAM writes JrxnSetup.xml and results_JRA_* into
+            # pathResults, which concurrent windows of the same trial share,
+            # and then globs its results back from there.
+            with SharedPrepLock(pathResults, name='joint_reaction'):
+                c_KAM = computeKAM(pathGenericTemplates,
+                                   pathResults, pathModelFile, IDPath,
+                                   IKPath, GRFPath, grfType='sphere',
+                                   contactSides=contactSides,
+                                   contactSpheres=contactSpheres,
+                                   Qds=Qds_opt_nsc.T)
             KAM = np.concatenate(
                 (np.expand_dims(c_KAM['KAM_r'], axis=1),
                  np.expand_dims(c_KAM['KAM_l'], axis=1)), axis=1).T              
@@ -2626,15 +2685,18 @@ def run_tracking(baseDir, dataDir, subject, settings, case='0',
                 'kinematics_activations_{}_{}.mot'.format(trialName, case))
             GRFPath = os.path.join(
                 pathResults, 'GRF_{}_{}.mot'.format(trialName, case))                
-            c_MCF = computeMCF(pathGenericTemplates, pathResults, 
-                               pathModelFile, IK_act_Path, 
-                               IK_act_Path, GRFPath, grfType='sphere',
-                               contactSides=contactSides,
-                               contactSpheres=contactSpheres,
-                               muscleForceFilePath=forcePath,
-                               pathReserveGeneralizedForces=forcePath,
-                               Qds=Qds_opt_nsc.T,
-                               replaceMuscles=True)
+            # Locked for the same reason as computeKAM: results_JRAforMCF_*
+            # and JrxnSetup.xml land in the shared pathResults.
+            with SharedPrepLock(pathResults, name='joint_reaction'):
+                c_MCF = computeMCF(pathGenericTemplates, pathResults,
+                                   pathModelFile, IK_act_Path,
+                                   IK_act_Path, GRFPath, grfType='sphere',
+                                   contactSides=contactSides,
+                                   contactSpheres=contactSpheres,
+                                   muscleForceFilePath=forcePath,
+                                   pathReserveGeneralizedForces=forcePath,
+                                   Qds=Qds_opt_nsc.T,
+                                   replaceMuscles=True)
             MCF = np.concatenate(
                 (np.expand_dims(c_MCF['MCF_r'], axis=1),
                  np.expand_dims(c_MCF['MCF_l'], axis=1)), axis=1).T
