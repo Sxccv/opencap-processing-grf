@@ -310,6 +310,14 @@ def parse_args(argv=None):
     parser.add_argument("--only-missing", action="store_true",
                         help="Re-run only windows that previously failed "
                              "(skips converged ones per window_manifest).")
+    # Literal copy of kinematicsQC.DRIFT_CORRECTIONS: that module is imported
+    # only inside main(), after its search path is set up. run_qc_pass
+    # validates the value again.
+    parser.add_argument("--drift-correction", default="dedrift",
+                        choices=["dedrift", "none"],
+                        help="QC pass step 2: apply the pelvis_ty de-drift "
+                             "('dedrift') or record it without applying it "
+                             "('none'). [default: %(default)s]")
     parser.add_argument("--max-workers", type=int, default=None,
                         help="Cap the RAM/CPU-derived worker pool size at "
                              "this many concurrent windows. [default: "
@@ -388,9 +396,12 @@ def main(argv=None):
         spec.motion_type, [raw_start, raw_end], spec.repetition,
         spec.treadmill_speed, spec.contact_side, use_local_data=True)
     run_qc_pass(spec.dataFolder, spec.session_id, spec.trial_name,
-                OpenSimModel=trial_settings['OpenSimModel'])
-    qc = verify_qc_marker(spec.dataFolder, spec.session_id, spec.trial_name)
+                OpenSimModel=trial_settings['OpenSimModel'],
+                drift_correction=args.drift_correction)
+    qc = verify_qc_marker(spec.dataFolder, spec.session_id, spec.trial_name,
+                          drift_correction=args.drift_correction)
     qc_marker = {'qc_version': qc['qc_version'],
+                 'drift_correction': qc['drift_correction'],
                  'kinematics_sha256': qc['kinematics_sha256']}
 
     start, end = resolve_time_range(spec.kinematics_mot, START_TIME, END_TIME)

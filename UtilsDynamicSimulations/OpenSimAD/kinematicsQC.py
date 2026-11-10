@@ -49,6 +49,22 @@ This file rewrites ``<trial>.mot`` in place; the pre-QC file is preserved as
 ``<trial>_raw.mot`` and a ``<trial>_qc.json`` sidecar records what was done,
 so later stages (and `verify_qc_marker`) can confirm the QC pass actually ran
 against the kinematics file they are about to read.
+
+``drift_correction`` switches step 2 on (``'dedrift'``, the default) or off
+(``'none'``). With ``'none'`` the trend fits, the method selection and the
+A5 measurement still run and are recorded, but ``pelvis_ty`` is written back
+unchanged; the glitch trim (step 1) and the flip detection (step 3) are
+unaffected. It exists so the de-drift can be ablated against an upstream
+fix (the calibration-tilt correction, ``docs/fix-history/
+drift_root_cause_calibration.md``) with everything else held fixed.
+
+A re-run always starts from the pre-QC kinematics: when the current
+``<trial>.mot`` is itself the output of an earlier QC pass (its SHA-256 is
+the one the existing sidecar recorded), the pass reads ``<trial>_raw.mot``
+instead and leaves it untouched. Without this, switching ``drift_correction``
+(or bumping ``QC_VERSION``) would re-process already corrected kinematics,
+overwrite ``<trial>_raw.mot`` with them, and -- once a glitch frame had been
+trimmed -- fail the kinematics/markers frame-count check.
 """
 import os
 import json
@@ -86,6 +102,12 @@ FLIP_THRESHOLD_DEG = 20.0
 MULTI_COORD_STEP_DEG = 25.0
 MULTI_COORD_MIN_COUNT = 3
 GRAVITY_M_S2 = 9.80665
+
+# Values of run_qc_pass's `drift_correction`. A sidecar written before the
+# switch existed has no such key; it always applied the de-drift, so a missing
+# key reads as 'dedrift'.
+DRIFT_CORRECTIONS = ('dedrift', 'none')
+DEFAULT_DRIFT_CORRECTION = 'dedrift'
 
 
 class KinematicsQCError(RuntimeError):
@@ -338,13 +360,19 @@ def _step4_constant(bin_residuals_after_step3):
 # %% Public API.
 
 def run_qc_pass(dataFolder, session_id, trial_name,
-                OpenSimModel="LaiUhlrich2022", bin_seconds=1.0):
+                OpenSimModel="LaiUhlrich2022", bin_seconds=1.0,
+                drift_correction=DEFAULT_DRIFT_CORRECTION):
     """Run (or skip, if already current) the pre-flight kinematics QC pass.
 
     Idempotent: if ``<trial>_qc.json`` already records ``qc_version ==
-    QC_VERSION`` and a ``kinematics_sha256`` matching the current
-    ``<trial>.mot``, that sidecar is returned unchanged and nothing else
-    happens.
+    QC_VERSION``, the same ``drift_correction`` and a ``kinematics_sha256``
+    matching the current ``<trial>.mot``, that sidecar is returned unchanged
+    and nothing else happens. Any other re-run reads ``<trial>_raw.mot``
+    when the current ``<trial>.mot`` is an earlier QC output (see the module
+    docstring).
+
+    ``drift_correction='none'`` records the de-drift fits but does not apply
+    them to ``pelvis_ty``.
 
     Otherwise, in order: requires the trial's `{OpenSimModel}
     _scaled_adjusted_contacts.osim` contact model (raises if it is missing --
@@ -372,10 +400,16 @@ def run_qc_pass(dataFolder, session_id, trial_name,
 
     Returns the sidecar dict.
     """
+    if drift_correction not in DRIFT_CORRECTIONS:
+        raise ValueError(
+            f"drift_correction must be one of {DRIFT_CORRECTIONS}, got "
+            f"{drift_correction!r}.")
     mot_path = kinematics_mot(dataFolder, session_id, trial_name)
+    raw_path = kinematics_raw_mot(dataFolder, session_id, trial_name)
     sidecar_path = qc_sidecar_path(dataFolder, session_id, trial_name)
 
     # --- Step 1: idempotence check, first, before anything else. ---
+    mot_is_qc_output = False
     if os.path.exists(sidecar_path) and os.path.exists(mot_path):
         try:
             with open(sidecar_path) as f:
@@ -383,9 +417,23 @@ def run_qc_pass(dataFolder, session_id, trial_name,
         except (OSError, ValueError):
             existing = None
         if (existing is not None
-                and existing.get('qc_version') == QC_VERSION
                 and existing.get('kinematics_sha256') == _sha256_file(mot_path)):
-            return existing
+            if (existing.get('qc_version') == QC_VERSION
+                    and existing.get('drift_correction', DEFAULT_DRIFT_CORRECTION)
+                    == drift_correction):
+                return existing
+            mot_is_qc_output = True
+
+    # Re-runs start from the pre-QC kinematics, never from a QC output.
+    if mot_is_qc_output:
+        if not os.path.exists(raw_path):
+            raise KinematicsQCError(
+                f"trial {trial_name}: {mot_path} is the output of an earlier "
+                f"QC pass but the pre-QC kinematics {raw_path} are missing; "
+                "re-run IK to regenerate the trial's .mot.")
+        source_path = raw_path
+    else:
+        source_path = mot_path
 
     # --- Step 2: require the contact model. ---
     model_path = os.path.join(session_dir(dataFolder, session_id), 'OpenSimData',
@@ -406,11 +454,11 @@ def run_qc_pass(dataFolder, session_id, trial_name,
             f"trial {trial_name}: contact model {model_path} has no "
             "SmoothSphereHalfSpaceForce contact spheres.")
 
-    # --- Step 3: read the .mot. ---
-    if not os.path.exists(mot_path):
+    # --- Step 3: read the .mot (or, on a re-run, the preserved pre-QC copy). ---
+    if not os.path.exists(source_path):
         raise KinematicsQCError(
-            f"trial {trial_name}: kinematics file not found at {mot_path}.")
-    header, data = _read_mot(mot_path)
+            f"trial {trial_name}: kinematics file not found at {source_path}.")
+    header, data = _read_mot(source_path)
     mot_times = data[:, 0]
 
     # --- Step 4: read the .trc and assert the shared time base. ---
@@ -422,7 +470,7 @@ def run_qc_pass(dataFolder, session_id, trial_name,
     if len(trc_times) != len(mot_times):
         raise KinematicsQCError(
             f"trial {trial_name}: frame count mismatch between kinematics "
-            f"({len(mot_times)} rows in {mot_path}) and markers "
+            f"({len(mot_times)} rows in {source_path}) and markers "
             f"({len(trc_times)} rows in {trc_path}); they must share the "
             "same time base.")
     frame_rate = 1.0 / np.median(np.diff(mot_times))
@@ -430,7 +478,7 @@ def run_qc_pass(dataFolder, session_id, trial_name,
         raise KinematicsQCError(
             f"trial {trial_name}: kinematics and marker time stamps disagree "
             f"by more than a quarter frame at {frame_rate:.3f} Hz "
-            f"({mot_path} vs {trc_path}).")
+            f"({source_path} vs {trc_path}).")
 
     # --- Step 5: B1 glitch detection and trimming. ---
     flagged, trial_median_speed, eff_threshold = _glitch_frames(mot_times, xyz)
@@ -567,7 +615,16 @@ def run_qc_pass(dataFolder, session_id, trial_name,
     step4_constant = _step4_constant(bin_residuals_after_step3)
     bin_residuals_after_step4 = bin_residuals_after_step3 - step4_constant
 
-    shift_per_frame = value_full + step4_constant
+    # The shift is always computed and recorded; drift_correction='none'
+    # leaves it unapplied. `low_dedrifted` is what the clearance would be with
+    # the shift applied, `low_corrected` what it is in the file written below.
+    dedrift_applied = drift_correction == 'dedrift'
+    candidate_shift_per_frame = value_full + step4_constant
+    low_dedrifted = low_filt - candidate_shift_per_frame
+    if dedrift_applied:
+        shift_per_frame = candidate_shift_per_frame
+    else:
+        shift_per_frame = np.zeros_like(candidate_shift_per_frame)
     data[:, pelvis_ty_col] = data[:, pelvis_ty_col] - shift_per_frame
     low_corrected = low_filt - shift_per_frame
 
@@ -596,7 +653,7 @@ def run_qc_pass(dataFolder, session_id, trial_name,
         if mask.any() and np.all(low_corrected[mask] > CLEARANCE_GATE_M):
             fully_airborne_bins.append([float(a), float(b)])
 
-    if method == 'per_window' and fully_airborne_bins:
+    if dedrift_applied and method == 'per_window' and fully_airborne_bins:
         a0, b0 = fully_airborne_bins[0]
         raise KinematicsQCError(
             f"trial {trial_name}: the per-window de-drift fallback was "
@@ -638,8 +695,11 @@ def run_qc_pass(dataFolder, session_id, trial_name,
         'multi_coordinate_min_count': MULTI_COORD_MIN_COUNT,
     }
 
-    # --- Step 12: A5 horizontal drift. ---
-    stance_mask = low_corrected <= CLEARANCE_GATE_M
+    # --- Step 12: A5 horizontal drift. Stance is detected on the de-drifted
+    # clearance whether or not the shift was applied, so this diagnostic means
+    # the same thing in both drift_correction arms (on uncorrected data the
+    # drifted feet would never read as stance). ---
+    stance_mask = low_dedrifted <= CLEARANCE_GATE_M
     speeds = []
     for si in range(len(spheres)):
         for k in range(len(times) - 1):
@@ -658,9 +718,10 @@ def run_qc_pass(dataFolder, session_id, trial_name,
         'gravity_bias_N_estimate': float(mass_kg * GRAVITY_M_S2 * np.sin(tilt_rad)),
     }
 
-    # --- Step 13: write outputs, in order. ---
-    raw_path = kinematics_raw_mot(dataFolder, session_id, trial_name)
-    shutil.copy2(mot_path, raw_path)
+    # --- Step 13: write outputs, in order. On a re-run the pre-QC copy is
+    # already in place (it is what this pass read) and stays as it is. ---
+    if source_path == mot_path:
+        shutil.copy2(mot_path, raw_path)
 
     numpy_to_storage(header, data, mot_path, datatype='IK')
 
@@ -669,6 +730,8 @@ def run_qc_pass(dataFolder, session_id, trial_name,
     sidecar = {
         'qc_version': QC_VERSION,
         'trial_name': trial_name,
+        'drift_correction': drift_correction,
+        'kinematics_source': 'raw_mot' if source_path == raw_path else 'mot',
         'kinematics_sha256': kinematics_sha256,
         'generated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'source_frame_count': int(n_source),
@@ -682,6 +745,7 @@ def run_qc_pass(dataFolder, session_id, trial_name,
             'effective_threshold_m_s': eff_threshold,
         },
         'dedrift': {
+            'applied': dedrift_applied,
             'method': method,
             'bin_seconds': float(bin_seconds),
             'bin_origin_s': float(times[0]),
@@ -738,7 +802,7 @@ def run_qc_pass(dataFolder, session_id, trial_name,
     return sidecar
 
 
-def verify_qc_marker(dataFolder, session_id, trial_name):
+def verify_qc_marker(dataFolder, session_id, trial_name, drift_correction=None):
     """Raise KinematicsQCError unless `<trial>_qc.json` matches `<trial>.mot`.
 
     Checks that the sidecar exists, its `qc_version` equals `QC_VERSION`, and
@@ -761,6 +825,13 @@ def verify_qc_marker(dataFolder, session_id, trial_name):
             f"trial {trial_name}: QC sidecar at {sidecar_path} was written "
             f"by qc_version {sidecar.get('qc_version')!r}, expected "
             f"{QC_VERSION}; re-run run_qc_pass.")
+
+    recorded = sidecar.get('drift_correction', DEFAULT_DRIFT_CORRECTION)
+    if drift_correction is not None and recorded != drift_correction:
+        raise KinematicsQCError(
+            f"trial {trial_name}: QC sidecar at {sidecar_path} was written "
+            f"with drift_correction={recorded!r}, expected "
+            f"{drift_correction!r}; re-run run_qc_pass.")
 
     mot_path = kinematics_mot(dataFolder, session_id, trial_name)
     if not os.path.exists(mot_path):

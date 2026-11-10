@@ -25,7 +25,8 @@ sys.path.append(opensimADDir)
 
 import pipeline_io
 from utilsOpenSimAD import processInputsOpenSimAD, plotResultsOpenSimAD
-from kinematicsQC import run_qc_pass, verify_qc_marker
+from kinematicsQC import (DEFAULT_DRIFT_CORRECTION, DRIFT_CORRECTIONS,
+                          run_qc_pass, verify_qc_marker)
 from mainOpenSimAD import run_tracking
 
 def read_mot_file_to_df(file_path):
@@ -116,6 +117,9 @@ def parse_args(argv=None):
                              "[default: %(default)s]")
     parser.add_argument("--motion-type", default="walking",
                         help="Motion type, as in 02. [default: %(default)s]")
+    parser.add_argument("--drift-correction", default=DEFAULT_DRIFT_CORRECTION,
+                        choices=list(DRIFT_CORRECTIONS),
+                        help="QC pass step 2, as in 02. [default: %(default)s]")
     return parser.parse_args(argv)
 
 
@@ -139,8 +143,10 @@ def main(argv=None):
         [raw_start, raw_end], repetition, treadmill_speed, contact_side,
         use_local_data=True)
     run_qc_pass(dataFolder, session_id, trial_name,
-                OpenSimModel=trial_settings['OpenSimModel'])
-    verify_qc_marker(dataFolder, session_id, trial_name)
+                OpenSimModel=trial_settings['OpenSimModel'],
+                drift_correction=args.drift_correction)
+    verify_qc_marker(dataFolder, session_id, trial_name,
+                     drift_correction=args.drift_correction)
 
     # Same time-range reader and same windowing (including the merge of a
     # short trailing window) as 02, so both solve identical intervals.
