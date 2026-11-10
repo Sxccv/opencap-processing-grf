@@ -1,0 +1,16 @@
+== e42b56c0
+  Cam0: board found in 10/10 frames, inner-corner span 38 px wide; IPPE two-solution gap 18.2 deg (median)
+     frame-to-frame SD of board rotation about board x/y/z: 0.82 / 0.44 / 0.06 deg; range about x -2.73..-0.15; max angle from pickle 2.74 deg
+     Jacobian SD about board x/y/z per corner-noise sigma: 0.1 px -> 1.01/1.00/0.16 deg; 0.25 px -> 2.52/2.51/0.40 deg; 0.5 px -> 5.04/5.01/0.80 deg
+  Cam1: board found in 10/10 frames, inner-corner span 38 px wide; IPPE two-solution gap 17.9 deg (median)
+     frame-to-frame SD of board rotation about board x/y/z: 0.36 / 0.94 / 0.06 deg; range about x +0.17..+1.33; max angle from pickle 2.17 deg
+     Jacobian SD about board x/y/z per corner-noise sigma: 0.1 px -> 0.93/0.92/0.18 deg; 0.25 px -> 2.31/2.31/0.45 deg; 0.5 px -> 4.63/4.61/0.90 deg
+  Cam2: board found in 10/10 frames, inner-corner span 38 px wide; IPPE two-solution gap 14.7 deg (median)
+     frame-to-frame SD of board rotation about board x/y/z: 1.02 / 0.54 / 0.07 deg; range about x -0.03..+3.16; max angle from pickle 3.33 deg
+     Jacobian SD about board x/y/z per corner-noise sigma: 0.1 px -> 1.14/1.13/0.16 deg; 0.25 px -> 2.85/2.82/0.41 deg; 0.5 px -> 5.71/5.65/0.82 deg
+== 16c87051
+  Cam0: board found in 10/10 frames, inner-corner span 38 px wide; IPPE two-solution gap 16.5 deg (median)
+     frame-to-frame SD of board rotation about board x/y/z: 0.27 / 0.44 / 0.09 deg; range about x -0.05..+0.77; max angle from pickle 1.53 deg
+     Jacobian SD about board x/y/z per corner-noise sigma: 0.1 px -> 1.06/1.05/0.13 deg; 0.25 px -> 2.64/2.62/0.33 deg; 0.5 px -> 5.28/5.24/0.67 deg
+  Cam1: board not found in any frame
+  Cam2: no calibration video
